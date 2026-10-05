@@ -184,12 +184,14 @@ export const ExcelImportModal: React.FC<ExcelImportModalProps> = ({
       result.activities &&
       result.activities.length > 0
     ) {
-      setImportTarget("activities");
-      setParsedActivities(result.activities);
       if (target === "students") {
-        setSuccessMessage(
-          "הקובץ זוהה אוטומטית כקובץ חוגי יום שישי (שמות חוגים, שעות ומורים)! המערכת עברה למצב קליטת חוגים.",
+        setErrorMessage(
+          result.error ||
+            "לא זוהו תלמידים זכאים בקובץ שהועלה (הקובץ זוהה כקובץ חוגים). אם ברצונכם לייבא חוגים, אנא עברו ללשונית 'חוגי שישי'.",
         );
+      } else {
+        setImportTarget("activities");
+        setParsedActivities(result.activities);
       }
     } else if (
       result.detectedType === "students" &&
@@ -203,15 +205,15 @@ export const ExcelImportModal: React.FC<ExcelImportModalProps> = ({
           "הקובץ זוהה אוטומטית כקובץ תלמידים זכאים! המערכת עברה למצב קליטת תלמידים.",
         );
       }
+    } else if (result.students && result.students.length > 0) {
+      setImportTarget("students");
+      setParsedStudents(result.students);
     } else if (result.registrations && result.registrations.length > 0) {
       setImportTarget("registrations");
       setParsedRegistrations(result.registrations);
     } else if (result.activities && result.activities.length > 0) {
       setImportTarget("activities");
       setParsedActivities(result.activities);
-    } else if (result.students && result.students.length > 0) {
-      setImportTarget("students");
-      setParsedStudents(result.students);
     } else if (result.error) {
       setErrorMessage(result.error);
     } else {
@@ -442,10 +444,7 @@ export const ExcelImportModal: React.FC<ExcelImportModalProps> = ({
   };
 
   const handleApplyImport = () => {
-    if (
-      importTarget === "full_workbook" ||
-      (parsedStudents && (parsedRegistrations || parsedActivities))
-    ) {
+    if (importTarget === "full_workbook") {
       const res = importFullWorkbook({
         students: parsedStudents || undefined,
         activities: parsedActivities || undefined,
@@ -475,26 +474,52 @@ export const ExcelImportModal: React.FC<ExcelImportModalProps> = ({
     }
 
     if (parsedStudents && parsedStudents.length > 0) {
-      let options: ImportStudentsOptions | undefined;
+      const targetSchool =
+        studentSchoolFilter !== "all" ? studentSchoolFilter : currentSchoolId;
+
+      let options: ImportStudentsOptions = {
+        targetSchoolId: targetSchool,
+      };
 
       if (studentImportMode === "sync_changes") {
         const deleteIdsBySchool: Record<string, string[]> = {};
         diffAnalysis?.missingStudents.forEach((s) => {
           if (selectedDeleteIds[s.id]) {
-            const sId = s.schoolId || currentSchoolId;
+            const sId = s.schoolId || targetSchool;
             if (!deleteIdsBySchool[sId]) deleteIdsBySchool[sId] = [];
             deleteIdsBySchool[sId].push(s.id);
           }
         });
-        options = { deleteStudentIdsBySchool: deleteIdsBySchool };
+        options.deleteStudentIdsBySchool = deleteIdsBySchool;
       }
 
-      importStudents(parsedStudents, studentImportMode, options);
+      // If a specific school filter was selected, re-assign students strictly to that school
+      let studentsToImport = parsedStudents;
+      if (studentSchoolFilter !== "all") {
+        studentsToImport = parsedStudents.map((s) => ({
+          ...s,
+          schoolId: targetSchool,
+          schoolName: schools[targetSchool]?.school.name || s.schoolName,
+        }));
+      } else if (detectedSchoolCount <= 1) {
+        studentsToImport = parsedStudents.map((s) => ({
+          ...s,
+          schoolId: s.schoolId || targetSchool,
+          schoolName: schools[s.schoolId || targetSchool]?.school.name || s.schoolName,
+        }));
+      }
+
+      importStudents(studentsToImport, studentImportMode, options);
 
       const deletedCount =
         Object.values(selectedDeleteIds).filter(Boolean).length;
 
-      if (studentImportMode === "sync_changes") {
+      if (studentImportMode === "replace") {
+        const sName = schools[targetSchool]?.school.name || currentSchool.name;
+        setSuccessMessage(
+          `החלפה מלאה הושלמה בהצלחה! כל רשימת התלמידים הקודמת ב${sName} אופסה, והרשימה הוחלפה במלואה ל-${studentsToImport.length} תלמידים מקובץ האקסל.`,
+        );
+      } else if (studentImportMode === "sync_changes") {
         setSuccessMessage(
           `סנכרון שינויים הושלם בהצלחה! ${diffAnalysis?.updateCount || 0} תלמידים עודכנו, ${diffAnalysis?.newCount || 0} נוספו, ו-${deletedCount} הוסרו.`,
         );
@@ -502,7 +527,7 @@ export const ExcelImportModal: React.FC<ExcelImportModalProps> = ({
         setSuccessMessage(
           `נקלטו בהצלחה ${diffAnalysis?.newCount || 0} תלמידים חדשים (תלמידים קיימים נשמרו ללא שינוי).`,
         );
-      } else if (detectedSchoolCount > 1) {
+      } else if (detectedSchoolCount > 1 && studentSchoolFilter === "all") {
         const parts = Object.entries(studentsBySchoolMap).map(
           ([sId, count]) => {
             const sName =
@@ -519,17 +544,10 @@ export const ExcelImportModal: React.FC<ExcelImportModalProps> = ({
           `נקלטו ומוינו בהצלחה ${parsedStudents.length} תלמידים לפי עמודה J (בית הספר של העתיד): ${parts.join(", ")}!`,
         );
       } else {
-        const firstSchoolId =
-          Object.keys(studentsBySchoolMap)[0] || currentSchoolId;
         const sName =
-          schools[firstSchoolId]?.school.name ||
-          (firstSchoolId.includes("navon")
-            ? "יצחק נבון"
-            : firstSchoolId.includes("lapid")
-              ? 'לפיד המ"ה'
-              : currentSchool.name);
+          schools[targetSchool]?.school.name || currentSchool.name;
         setSuccessMessage(
-          `נקלטו בהצלחה ${parsedStudents.length} תלמידים זכאים עבור ${sName} לפי עמודה J!`,
+          `נקלטו בהצלחה ${studentsToImport.length} תלמידים זכאים עבור ${sName}!`,
         );
       }
 

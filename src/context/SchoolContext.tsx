@@ -261,25 +261,22 @@ interface SchoolContextType {
 const SchoolContext = createContext<SchoolContextType | null>(null);
 
 const mergeSchoolData = (localData: SchoolData, cloudData: SchoolData): SchoolData => {
-  const regMap = new Map<string, Registration>();
-  // 1. First keep all local/restored registrations
-  (localData.registrations || []).forEach((r) => regMap.set(r.studentId, r));
-  // 2. Add or update from cloud registrations
-  (cloudData.registrations || []).forEach((r) => regMap.set(r.studentId, r));
+  // Cloud data is authoritative for students, registrations and placements
+  // When cloudData contains these arrays, use them directly so deletes and full replacements are respected!
+  const students = Array.isArray(cloudData.students)
+    ? cloudData.students
+    : localData.students || [];
 
-  const plcMap = new Map<string, Placement>();
-  (localData.placements || []).forEach((p) => plcMap.set(p.id, p));
-  (cloudData.placements || []).forEach((p) => plcMap.set(p.id, p));
+  const registrations = Array.isArray(cloudData.registrations)
+    ? cloudData.registrations
+    : localData.registrations || [];
 
-  const studentMap = new Map<string, Student>();
-  (localData.students || []).forEach((s) => studentMap.set(s.id, s));
-  (cloudData.students || []).forEach((s) => studentMap.set(s.id, s));
-  const mergedStudents = Array.from(studentMap.values());
-
-  const mergedRegs = Array.from(regMap.values());
-  const mergedPlcs = Array.from(plcMap.values());
-  const finalPlacements =
-    mergedPlcs.length > 0 ? mergedPlcs : generatePlacementsForRegistrations(mergedRegs);
+  const placements =
+    Array.isArray(cloudData.placements) && cloudData.placements.length > 0
+      ? cloudData.placements
+      : Array.isArray(localData.placements) && localData.placements.length > 0
+        ? localData.placements
+        : generatePlacementsForRegistrations(registrations);
 
   // Preserve activities if cloud wiped or is empty
   const activities =
@@ -305,11 +302,13 @@ const mergeSchoolData = (localData: SchoolData, cloudData: SchoolData): SchoolDa
     school: {
       ...cloudData.school,
       coordinator: finalCoordinator,
+      fridaySlots:
+        cloudData.school?.fridaySlots || localData.school?.fridaySlots,
     },
-    students: mergedStudents,
+    students,
     activities,
-    registrations: mergedRegs,
-    placements: finalPlacements,
+    registrations,
+    placements,
   };
 };
 
@@ -381,24 +380,18 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({
       }
     }
 
-    // Deep forensic scan of all browser storages for any previous registrations or students
+    // Emergency forensic scan for empty schools only (prevents resurrection of deleted/replaced students)
     try {
       const scan = deepScanBrowserForData(freshSchools);
       Object.keys(freshSchools).forEach((k) => {
         const foundRegs = scan.foundRegistrations[k] || [];
         const foundStudents = scan.foundStudents[k] || [];
-        if (foundRegs.length > 0) {
-          const regMap = new Map<string, Registration>();
-          (freshSchools[k].registrations || []).forEach((r) => regMap.set(r.studentId, r));
-          foundRegs.forEach((r) => regMap.set(r.studentId, r));
-          freshSchools[k].registrations = Array.from(regMap.values());
-          freshSchools[k].placements = generatePlacementsForRegistrations(freshSchools[k].registrations);
+        if (foundRegs.length > 0 && (!freshSchools[k].registrations || freshSchools[k].registrations.length === 0)) {
+          freshSchools[k].registrations = foundRegs;
+          freshSchools[k].placements = generatePlacementsForRegistrations(foundRegs);
         }
-        if (foundStudents.length > 0) {
-          const stMap = new Map<string, Student>();
-          (freshSchools[k].students || []).forEach((s) => stMap.set(s.id, s));
-          foundStudents.forEach((s) => stMap.set(s.id, s));
-          freshSchools[k].students = Array.from(stMap.values());
+        if (foundStudents.length > 0 && (!freshSchools[k].students || freshSchools[k].students.length === 0)) {
+          freshSchools[k].students = foundStudents;
         }
       });
     } catch (e) {}
@@ -425,16 +418,13 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({
         }
       } catch (e) {}
 
-      // Restore custom students from local persistent cache if available
+      // Restore custom students from local persistent cache if available AND school currently has 0 students
       try {
         const savedStudentsRaw = localStorage.getItem(`saved_students_${k}`);
         if (savedStudentsRaw) {
           const savedStudents = JSON.parse(savedStudentsRaw);
-          if (Array.isArray(savedStudents) && savedStudents.length > 0) {
-            const stMap = new Map<string, Student>();
-            freshSchools[k].students.forEach((s) => stMap.set(s.id, s));
-            savedStudents.forEach((s: Student) => stMap.set(s.id, s));
-            freshSchools[k].students = Array.from(stMap.values());
+          if (Array.isArray(savedStudents) && savedStudents.length > 0 && (!freshSchools[k].students || freshSchools[k].students.length === 0)) {
+            freshSchools[k].students = savedStudents;
           }
         }
       } catch (e) {}
@@ -883,6 +873,7 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({
   ): string | null => {
     if (!schoolIdOrName) return null;
     const raw = String(schoolIdOrName).trim();
+    if (!raw) return null;
     if (schoolsMap[raw]) return raw;
 
     // Check with extractSchoolFromText (handles "בית הספר של העתיד (בן שמן)", etc.)
@@ -898,6 +889,24 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({
       .toLowerCase()
       .replace(/['"״\-_]/g, "")
       .trim();
+
+    // Prevent generic phrases like "בית ספר" or "יסודי" from matching randomly
+    const genericPhrases = [
+      "ביתספר",
+      "ביתהספר",
+      "ביס",
+      "יסודי",
+      "ממלכתי",
+      "העתיד",
+      "שלהעתיד",
+      "ביתהספרשלהעתיד",
+      "ביתספרשלהעתיד",
+      "תלמידים",
+    ];
+    if (genericPhrases.includes(clean) || clean.length < 3) {
+      return null;
+    }
+
     for (const [key, val] of Object.entries(schoolsMap)) {
       const keyClean = key
         .toLowerCase()
@@ -907,13 +916,17 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({
         .toLowerCase()
         .replace(/['"״\-_]/g, "")
         .trim();
+
+      // Check specific distinct school tokens
       if (
-        clean &&
-        (clean.includes(keyClean) ||
-          keyClean.includes(clean) ||
-          clean.includes(nameClean) ||
-          nameClean.includes(clean))
+        (key.includes("ben-shemen") && (clean.includes("שמן") || clean.includes("benshemen"))) ||
+        (key.includes("navon") && (clean.includes("נבון") || clean.includes("navon"))) ||
+        (key.includes("lapid") && (clean.includes("לפיד") || clean.includes("המה") || clean.includes("המד")))
       ) {
+        return key;
+      }
+
+      if (clean === keyClean || clean === nameClean) {
         return key;
       }
     }
@@ -932,18 +945,21 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({
           : "merge"
         : modeOrReplace || options?.mode || "merge";
 
+    const targetSchoolId = options?.targetSchoolId || currentSchoolId;
+
     setSchools((prev) => {
       // 1. Group imported students by detected schoolId (resolved against known schools in prev)
       const studentsBySchool: Record<string, Student[]> = {};
 
       imported.forEach((student) => {
+        const explicitOtherSchool = student.schoolId && student.schoolId !== targetSchoolId
+          ? resolveSchoolKey(student.schoolId, prev)
+          : null;
+
         const resolvedKey =
-          resolveSchoolKey(student.schoolId, prev) ||
-          resolveSchoolKey(student.schoolName, prev) ||
-          (options?.targetSchoolId
-            ? resolveSchoolKey(options.targetSchoolId, prev)
-            : null) ||
-          currentSchoolId;
+          explicitOtherSchool ||
+          (student.schoolName ? resolveSchoolKey(student.schoolName, prev) : null) ||
+          targetSchoolId;
 
         if (!studentsBySchool[resolvedKey]) {
           studentsBySchool[resolvedKey] = [];
@@ -957,9 +973,14 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({
 
       const updatedSchools: Record<string, SchoolData> = { ...prev };
 
-      // Update each affected school
-      Object.keys(studentsBySchool).forEach((schoolKey) => {
-        const schoolStudents = studentsBySchool[schoolKey];
+      // In replace mode, if targetSchoolId is specified, ensure targetSchoolId is updated and replaced!
+      const schoolsToUpdate = new Set<string>(Object.keys(studentsBySchool));
+      if (mode === "replace" && targetSchoolId && !schoolsToUpdate.has(targetSchoolId)) {
+        schoolsToUpdate.add(targetSchoolId);
+      }
+
+      schoolsToUpdate.forEach((schoolKey) => {
+        const schoolStudents = studentsBySchool[schoolKey] || [];
         const currentData = prev[schoolKey];
         if (!currentData) return;
 
@@ -968,8 +989,23 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({
         let placementsToKeep = currentData.placements;
 
         if (mode === "replace") {
-          // Full replacement
-          newStudents = schoolStudents;
+          // Full replacement: Deduplicate by ID and replace all students
+          const seen = new Set<string>();
+          newStudents = schoolStudents.filter((s) => {
+            const clean = s.id ? s.id.trim() : "";
+            if (!clean || seen.has(clean)) return false;
+            seen.add(clean);
+            return true;
+          });
+
+          // Clean up registrations & placements for students that were removed
+          const newStudentIds = new Set(newStudents.map((s) => s.id));
+          registrationsToKeep = currentData.registrations.filter((r) =>
+            newStudentIds.has(r.studentId),
+          );
+          placementsToKeep = currentData.placements.filter((p) =>
+            newStudentIds.has(p.studentId),
+          );
         } else if (mode === "add_only") {
           // Only add students not already in the system
           const existingIds = new Set(currentData.students.map((s) => s.id));
@@ -1038,51 +1074,17 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({
 
         updatedSchools[schoolKey] = updatedData;
         saveSchoolDataToFirestore(schoolKey, updatedData);
+
+        // Clear legacy local storage backup keys for this school to avoid zombie resurrection
+        try {
+          localStorage.removeItem(`saved_students_${schoolKey}`);
+        } catch (e) {}
       });
 
-      // Cross-school cleanup: Ensure each imported student exists ONLY in their assigned school
-      // This strictly prevents students from appearing in any other school or being dumped into the currently selected school
-      const studentTargetSchoolMap = new Map<string, string>();
-      Object.entries(studentsBySchool).forEach(([sKey, sList]) => {
-        sList.forEach((s) => {
-          studentTargetSchoolMap.set(s.id, sKey);
-        });
-      });
-
-      Object.keys(updatedSchools).forEach((schoolKey) => {
-        const schoolData = updatedSchools[schoolKey];
-        if (!schoolData) return;
-
-        // Check if any student in this school actually belongs to a different school according to this import
-        const foreignStudentIds = new Set<string>();
-        schoolData.students.forEach((s) => {
-          const targetSchool = studentTargetSchoolMap.get(s.id);
-          if (targetSchool && targetSchool !== schoolKey) {
-            foreignStudentIds.add(s.id);
-          }
-        });
-
-        if (foreignStudentIds.size > 0) {
-          const cleanedStudents = schoolData.students.filter(
-            (s) => !foreignStudentIds.has(s.id),
-          );
-          const cleanedRegistrations = schoolData.registrations.filter(
-            (r) => !foreignStudentIds.has(r.studentId),
-          );
-          const cleanedPlacements = schoolData.placements.filter(
-            (p) => !foreignStudentIds.has(p.studentId),
-          );
-
-          const cleanedData: SchoolData = {
-            ...schoolData,
-            students: cleanedStudents,
-            registrations: cleanedRegistrations,
-            placements: cleanedPlacements,
-          };
-          updatedSchools[schoolKey] = cleanedData;
-          saveSchoolDataToFirestore(schoolKey, cleanedData);
-        }
-      });
+      // Update local storage immediately
+      try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(updatedSchools));
+      } catch (e) {}
 
       return updatedSchools;
     });

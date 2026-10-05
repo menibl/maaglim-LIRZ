@@ -978,10 +978,14 @@ export function detectSheetType(worksheet: XLSX.WorkSheet): {
   let type: "activities" | "students" | "registrations" | "unknown" = "unknown";
   if (registrationScore >= 12) {
     type = "registrations";
-  } else if (activityScore >= 8 && activityScore >= studentScore) {
-    type = "activities";
-  } else if (studentScore >= 8 && studentScore > activityScore) {
+  } else if (studentScore >= 8 && studentScore >= activityScore) {
     type = "students";
+  } else if (activityScore >= 8 && activityScore > studentScore) {
+    type = "activities";
+  } else if (studentScore > 0 && studentScore >= activityScore) {
+    type = "students";
+  } else if (activityScore > 0) {
+    type = "activities";
   }
 
   return { type, activityScore, studentScore, registrationScore };
@@ -1129,7 +1133,7 @@ function parseAllowedGrades(raw: string | undefined): string[] {
 export const CANONICAL_SCHOOLS = {
   BEN_SHEMEN: { id: "sch-ben-shemen", name: "בית ספר בן שמן" },
   NAVON: { id: "sch-yitzhak-navon", name: "בית ספר יצחק נבון" },
-  LAPID: { id: "sch-lapid", name: 'בית ספר לפיד המ"ה' },
+  LAPID: { id: "sch-lapid-hmd", name: 'בית ספר לפיד המ"ד' },
 };
 
 export function canonicalizeSchoolId(rawIdOrName: string | undefined): string {
@@ -1138,9 +1142,10 @@ export function canonicalizeSchoolId(rawIdOrName: string | undefined): string {
   if (
     str === "sch-ben-shemen" ||
     str === "sch-yitzhak-navon" ||
+    str === "sch-lapid-hmd" ||
     str === "sch-lapid"
   ) {
-    return str;
+    return str === "sch-lapid" ? "sch-lapid-hmd" : str;
   }
   const clean = str
     .toLowerCase()
@@ -1160,13 +1165,14 @@ export function canonicalizeSchoolId(rawIdOrName: string | undefined): string {
   if (
     clean.includes("לפיד") ||
     clean.includes("המה") ||
+    clean.includes("המד") ||
     clean.includes("lapid")
   ) {
-    return "sch-lapid";
+    return "sch-lapid-hmd";
   }
   if (str === "ben-shemen") return "sch-ben-shemen";
   if (str === "yitzhak-navon") return "sch-yitzhak-navon";
-  if (str === "lapid") return "sch-lapid";
+  if (str === "lapid" || str === "sch-lapid") return "sch-lapid-hmd";
   return str.startsWith("sch-") ? str : `sch-${str}`;
 }
 
@@ -1220,15 +1226,17 @@ export function extractSchoolFromText(
       return { schoolId: "sch-yitzhak-navon", schoolName: "בית ספר יצחק נבון" };
     }
 
-    // Check Lapid HaM"H (לפיד המ"ה)
+    // Check Lapid HaM"H (לפיד המ"ד)
     if (
       clean.includes("לפיד") ||
       clean.includes("המה") ||
+      clean.includes("המד") ||
       clean.includes("ה מה") ||
+      clean.includes("ה מד") ||
       clean.includes("lapid") ||
       clean === "לפיד"
     ) {
-      return { schoolId: "sch-lapid", schoolName: 'בית ספר לפיד המ"ה' };
+      return { schoolId: "sch-lapid-hmd", schoolName: 'בית ספר לפיד המ"ד' };
     }
   }
 
@@ -1423,8 +1431,8 @@ export function detectSchoolFromRow(
   }
   if (canonicalFallback.includes("lapid")) {
     return {
-      schoolId: "sch-lapid",
-      schoolName: 'בית ספר לפיד המ"ה',
+      schoolId: "sch-lapid-hmd",
+      schoolName: 'בית ספר לפיד המ"ד',
       isExplicitlyDetected: false,
     };
   }
@@ -1463,9 +1471,9 @@ export function parseStudentsSheet(
 ): Student[] {
   if (!worksheet) return [];
 
-  // Guard: If this sheet has strong activity indicators, do NOT parse it as students!
+  // Guard: If this sheet has strong activity indicators AND zero student indicators, skip it
   const sheetAnalysis = detectSheetType(worksheet);
-  if (sheetAnalysis.type === "activities") {
+  if (sheetAnalysis.type === "activities" && sheetAnalysis.studentScore === 0) {
     return [];
   }
 
@@ -2697,24 +2705,6 @@ export async function parseExcelFile(
     // CASE C: User explicitly requested Students
     // =========================================================
     if (expectedType === "students") {
-      // If the uploaded file is clearly an activities file, auto-parse activities and inform!
-      if (
-        bestActivitySheet &&
-        bestActivitySheet.analysis.type === "activities"
-      ) {
-        const activities = parseActivitiesSheet(
-          bestActivitySheet.worksheet,
-          bestActivitySheet.sheetName,
-        );
-        if (activities.length > 0) {
-          return {
-            activities,
-            detectedType: "activities",
-            sheetName: bestActivitySheet.sheetName,
-          };
-        }
-      }
-
       const target = bestStudentSheet || sheetProfiles[0];
       let students = parseStudentsSheet(
         target.worksheet,
@@ -2751,6 +2741,27 @@ export async function parseExcelFile(
             registrationCount: 0,
           },
         };
+      }
+
+      // Only if NO students were found across all sheets, check if file is exclusively activities
+      if (
+        bestActivitySheet &&
+        bestActivitySheet.analysis.type === "activities" &&
+        bestActivitySheet.analysis.studentScore === 0
+      ) {
+        const activities = parseActivitiesSheet(
+          bestActivitySheet.worksheet,
+          bestActivitySheet.sheetName,
+        );
+        if (activities.length > 0) {
+          return {
+            activities,
+            detectedType: "activities",
+            sheetName: bestActivitySheet.sheetName,
+            error:
+              'קובץ זה זוהה כקובץ חוגים בלבד ולא נמצאו בו תלמידים. אם ברצונכם לייבא חוגים, אנא עברו ללשונית "חוגי שישי".',
+          };
+        }
       }
 
       // Fallback: check if it's an activities file
