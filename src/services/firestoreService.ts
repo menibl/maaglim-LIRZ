@@ -544,7 +544,24 @@ export async function saveAllSchoolsToFirestore(
   }
 }
 
-export async function flushPendingRegistrations(schoolId: string): Promise<void> {
+export function readPendingRegistrations(
+  schoolId: string,
+): Array<{ reg: Registration; placements: Placement[]; timestamp?: string }> {
+  const id = canonicalSchoolKey(schoolId) || schoolId;
+  try {
+    if (typeof localStorage === "undefined") return [];
+    const raw = localStorage.getItem(`pending_regs_${id}`);
+    const queue = raw ? JSON.parse(raw) : [];
+    return Array.isArray(queue) ? queue : [];
+  } catch {
+    return [];
+  }
+}
+
+export async function flushPendingRegistrations(
+  schoolId: string,
+  serverRegistrations?: Registration[],
+): Promise<void> {
   const id = canonicalSchoolKey(schoolId) || schoolId;
   let queue: Array<{ reg: Registration; placements: Placement[]; timestamp?: string }> = [];
   try {
@@ -555,6 +572,10 @@ export async function flushPendingRegistrations(schoolId: string): Promise<void>
   }
   if (!Array.isArray(queue) || queue.length === 0) return;
   const tombstones = typeof localStorage === "undefined" ? {} : readTombstones(localStorage);
+  const serverByStudent = new Map<string, Registration>();
+  (serverRegistrations || []).forEach((reg) => {
+    if (reg?.studentId) serverByStudent.set(reg.studentId, reg);
+  });
   const remaining: typeof queue = [];
   for (const item of queue) {
     if (!item?.reg) continue;
@@ -564,6 +585,10 @@ export async function flushPendingRegistrations(schoolId: string): Promise<void>
       Date.parse(tombstones[tombKey(id, "registrationStudent", item.reg.studentId)] || "") || 0,
     );
     if (blockedAt && pendingTime <= blockedAt) continue;
+    const serverReg = serverByStudent.get(item.reg.studentId);
+    const serverTime = Date.parse(serverReg?.timestamp || "") || 0;
+    const regTime = Date.parse(item.reg.timestamp || "") || 0;
+    if (serverReg && serverTime >= regTime) continue;
     const result = await saveRegistrationToFirestore(id, item.reg, item.placements || []);
     if (!result.success) remaining.push(item);
   }
@@ -608,6 +633,7 @@ export function subscribeToSchools(
   callback: (
     schools: Record<string, SchoolData>,
     tombstones?: Record<string, Record<string, string>>,
+    updatedAtBySchool?: Record<string, string>,
   ) => void,
 ): () => void {
   try {
@@ -622,6 +648,7 @@ export function subscribeToSchools(
 
         const schoolsData: Record<string, SchoolData> = {};
         const tombstonesBySchool: Record<string, Record<string, string>> = {};
+        const updatedAtBySchool: Record<string, string> = {};
         snapshot.forEach((docSnap) => {
           const data = docSnap.data() as any;
           const hasPayload =
@@ -642,6 +669,12 @@ export function subscribeToSchools(
             ...(tombstonesBySchool[normalized.school.id] || {}),
             ...(data.tombstones || {}),
           };
+          if (typeof data?.updatedAt === "string" && data.updatedAt) {
+            const previous = updatedAtBySchool[normalized.school.id];
+            if (!previous || Date.parse(data.updatedAt) > Date.parse(previous)) {
+              updatedAtBySchool[normalized.school.id] = data.updatedAt;
+            }
+          }
         });
 
         if (Object.keys(schoolsData).length > 0) {
@@ -650,9 +683,9 @@ export function subscribeToSchools(
           try {
             localStorage.setItem("cloud_schools_full_cache", JSON.stringify(schoolsData));
           } catch (e) {}
-          callback(schoolsData, tombstonesBySchool);
+          callback(schoolsData, tombstonesBySchool, updatedAtBySchool);
           Object.keys(schoolsData).forEach((schoolId) => {
-            flushPendingRegistrations(schoolId).catch(() => undefined);
+            flushPendingRegistrations(schoolId, schoolsData[schoolId]?.registrations).catch(() => undefined);
           });
         }
       },
@@ -695,6 +728,7 @@ export function subscribeToSchools(
 export async function fetchSchoolsFromFirestore(): Promise<{
   success: boolean;
   schools?: Record<string, SchoolData>;
+  updatedAtBySchool?: Record<string, string>;
   error?: string;
   isQuotaExceeded?: boolean;
 }> {
@@ -707,6 +741,7 @@ export async function fetchSchoolsFromFirestore(): Promise<{
     }
 
     const schoolsData: Record<string, SchoolData> = {};
+    const updatedAtBySchool: Record<string, string> = {};
     snapshot.forEach((docSnap) => {
       const data = docSnap.data() as any;
       const hasPayload =
@@ -718,10 +753,13 @@ export async function fetchSchoolsFromFirestore(): Promise<{
       schoolsData[normalized.school.id] = existing
         ? mergeSchoolSnapshot(existing, normalized, { tombstones: data.tombstones || {} }).data
         : normalized;
+      if (typeof data?.updatedAt === "string" && data.updatedAt) {
+        updatedAtBySchool[normalized.school.id] = data.updatedAt;
+      }
     });
 
     updateSyncStatus("synced");
-    return { success: true, schools: schoolsData };
+    return { success: true, schools: schoolsData, updatedAtBySchool };
   } catch (error: any) {
     const isQuota =
       error?.code === "resource-exhausted" ||

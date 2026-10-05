@@ -67,6 +67,7 @@ import {
   updateRegistrationInFirestore,
   subscribeToGlobalSettings,
   subscribeToSchools,
+  readPendingRegistrations,
   fetchSchoolsFromFirestore,
   subscribeToSyncStatus,
   getCloudSyncStatus,
@@ -79,6 +80,8 @@ import {
   SchoolSnapshot,
   canonicalSchoolKey,
   diffDeletions,
+  adoptCloudSchool,
+  flattenTombstones,
   foldAliasSchools,
   forgetTombstoneKeys,
   hydrateSchools,
@@ -278,33 +281,26 @@ interface SchoolContextType {
 
 const SchoolContext = createContext<SchoolContextType | null>(null);
 
-const mergeSchoolData = (
-  localData: SchoolData,
+const applyRemoteSchool = (
+  localData: SchoolData | undefined,
   cloudData: SchoolData,
   tombstones?: Record<string, string>,
+  cloudUpdatedAt?: string,
 ): SchoolData => {
-  // Union both sides. Tombstones make an intentional delete stick, and a
-  // record that exists only on one side is kept. A cloud array is not copied
-  // over the local one wholesale, so a stale browser cannot wipe rows.
-  const merged = mergeSchoolSnapshot(localData, cloudData, { tombstones });
-  const data = merged.data;
-  const fridaySlots =
-    data.school?.fridaySlots && data.school.fridaySlots.length > 0
-      ? data.school.fridaySlots
-      : localData.school?.fridaySlots;
+  const pending = readPendingRegistrations(cloudData.school?.id || localData?.school?.id || "");
+  const adopted = adoptCloudSchool(localData, cloudData, {
+    tombstones,
+    cloudUpdatedAt,
+    pendingRegistrations: pending.map((item) => item.reg).filter(Boolean),
+    pendingPlacements: pending.flatMap((item) => item.placements || []),
+  });
   return {
-    ...data,
-    school: {
-      ...data.school,
-      fridaySlots: fridaySlots || data.school?.fridaySlots || [],
-    },
+    ...adopted,
     activities:
-      data.activities && data.activities.length > 0
-        ? data.activities
-        : localData.activities && localData.activities.length > 0
-          ? localData.activities
-          : getOfficialActivitiesForSchool(data.school?.id || localData.school?.id),
-  };
+      adopted.activities && adopted.activities.length > 0
+        ? adopted.activities
+        : getOfficialActivitiesForSchool(adopted.school?.id || cloudData.school?.id),
+  } as SchoolData;
 };
 
 export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({
@@ -443,6 +439,7 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({
   );
   const [lastSummary, setLastSummary] = useState<PlacementSummary | null>(null);
   const isInitialCloudSyncDone = useRef(false);
+  const authoritativeCloudSync = useRef(false);
 
   // 1. Subscribe to Cloud Firestore Real-time Updates (Global Logo & Settings)
   useEffect(() => {
@@ -455,44 +452,29 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({
       }
     });
 
-    const unsubscribeSchools = subscribeToSchools(async (cloudSchools, cloudTombstones) => {
+    const unsubscribeSchools = subscribeToSchools(async (cloudSchools, cloudTombstones, updatedAtBySchool) => {
       if (cloudSchools && Object.keys(cloudSchools).length > 0) {
         isInitialCloudSyncDone.current = true;
         const enrichedCloud = enrichAllSchoolsActivities(cloudSchools);
-        if (cloudTombstones) {
-          try {
-            const localTombstones = readTombstones(localStorage);
-            const mergedTombstones = { ...localTombstones };
-            Object.entries(cloudTombstones).forEach(([schoolId, marks]) => {
-              Object.entries(marks || {}).forEach(([key, at]) => {
-                if (!mergedTombstones[key] || Date.parse(at) > Date.parse(mergedTombstones[key] || "")) {
-                  mergedTombstones[key] = at;
-                }
-              });
-              void schoolId;
-            });
-            writeTombstones(localStorage, mergedTombstones);
-          } catch (e) {}
-        }
+        const cloudMarks = flattenTombstones(cloudTombstones);
+        try {
+          writeTombstones(localStorage, cloudMarks);
+        } catch (e) {}
+        authoritativeCloudSync.current = true;
         setSchools((prev) => {
-          const merged: Record<string, SchoolData> = { ...prev };
-          const tombstones = (() => {
-            try {
-              return readTombstones(localStorage);
-            } catch {
-              return {};
-            }
-          })();
+          const adopted: Record<string, SchoolData> = {};
           Object.entries(enrichedCloud).forEach(([sId, cData]) => {
             const canonicalId = canonicalSchoolKey(sId) || sId;
             const local = prev[canonicalId] || prev[sId];
             const cloudTomb = cloudTombstones?.[sId] || cloudTombstones?.[canonicalId] || {};
-            merged[canonicalId] = local
-              ? mergeSchoolData(local, cData, { ...tombstones, ...cloudTomb })
-              : mergeSchoolData(cData, cData, { ...tombstones, ...cloudTomb });
-            if (canonicalId !== sId) delete merged[sId];
+            adopted[canonicalId] = applyRemoteSchool(
+              local,
+              cData,
+              cloudTomb,
+              updatedAtBySchool?.[sId] || updatedAtBySchool?.[canonicalId],
+            );
           });
-          return foldAliasSchools(merged) as Record<string, SchoolData>;
+          return foldAliasSchools(adopted) as Record<string, SchoolData>;
         });
         try {
           Object.entries(enrichedCloud).forEach(([sId, sData]) => {
@@ -512,29 +494,26 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({
 
   const refreshFromCloud = async (): Promise<{ success: boolean; error?: string }> => {
     const res = await fetchSchoolsFromFirestore();
-    if (res.success && res.schools) {
+    if (res.success && res.schools && Object.keys(res.schools).length > 0) {
       const enrichedCloud = enrichAllSchoolsActivities(res.schools);
+      authoritativeCloudSync.current = true;
       setSchools((prev) => {
-        const merged: Record<string, SchoolData> = { ...prev };
-        const tombstones = (() => {
-          try {
-            return readTombstones(localStorage);
-          } catch {
-            return {};
-          }
-        })();
+        const adopted: Record<string, SchoolData> = {};
         Object.entries(enrichedCloud).forEach(([sId, cData]) => {
           const canonicalId = canonicalSchoolKey(sId) || sId;
           const local = prev[canonicalId] || prev[sId];
-          merged[canonicalId] = local
-            ? mergeSchoolData(local, cData, tombstones)
-            : cData;
+          adopted[canonicalId] = applyRemoteSchool(
+            local,
+            cData,
+            undefined,
+            res.updatedAtBySchool?.[sId] || res.updatedAtBySchool?.[canonicalId],
+          );
         });
-        return foldAliasSchools(merged) as Record<string, SchoolData>;
+        return foldAliasSchools(adopted) as Record<string, SchoolData>;
       });
       return { success: true };
     }
-    return { success: false, error: res.error };
+    return { success: false, error: res.error || "לא התקבלו נתונים מהענן" };
   };
 
   const uploadLocalDataToCloud = async (): Promise<{ success: boolean; error?: string }> => {
@@ -613,7 +592,11 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({
 
   useEffect(() => {
     try {
-      persistSchoolsSnapshot(localStorage, schools as Record<string, SchoolSnapshot>);
+      const authoritative = authoritativeCloudSync.current;
+      authoritativeCloudSync.current = false;
+      persistSchoolsSnapshot(localStorage, schools as Record<string, SchoolSnapshot>, {
+        authoritative,
+      });
     } catch (e) {}
   }, [schools]);
 
