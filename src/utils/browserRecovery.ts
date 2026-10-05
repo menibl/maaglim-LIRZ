@@ -1,5 +1,6 @@
 import { Registration, Student } from "../types";
 import { SchoolData } from "../data/initialData";
+import { canonicalSchoolKey, readTombstones, tombKey } from "../services/dataSafety";
 
 export interface RecoveryScanResult {
   foundRegistrations: Record<string, Registration[]>;
@@ -102,10 +103,10 @@ function inspectAndExtract(
     node.forEach((item) => {
       if (isRegistration(item)) {
         const schoolKey = resolveSchoolForRegistration(item, schools);
-        addRegistration(item, schoolKey, result, seenRegKeys);
+        if (schoolKey) addRegistration(item, schoolKey, result, seenRegKeys);
       } else if (isStudent(item)) {
         const schoolKey = resolveSchoolForStudent(item, schools);
-        addStudent(item, schoolKey, result, seenStudentKeys);
+        if (schoolKey) addStudent(item, schoolKey, result, seenStudentKeys);
       } else if (typeof item === "object") {
         inspectAndExtract(item, schools, result, seenRegKeys, seenStudentKeys);
       }
@@ -126,13 +127,13 @@ function inspectAndExtract(
   // 4. If this object itself is a single Registration
   if (isRegistration(node)) {
     const sKey = resolveSchoolForRegistration(node, schools);
-    addRegistration(node, sKey, result, seenRegKeys);
+    if (sKey) addRegistration(node, sKey, result, seenRegKeys);
   }
 
   // 5. If this object itself is a single Student
   if (isStudent(node)) {
     const sKey = resolveSchoolForStudent(node, schools);
-    addStudent(node, sKey, result, seenStudentKeys);
+    if (sKey) addStudent(node, sKey, result, seenStudentKeys);
   }
 
   // Recursively inspect nested object properties
@@ -144,13 +145,25 @@ function inspectAndExtract(
 }
 
 function isRegistration(item: any): boolean {
+  if (!item || typeof item !== "object" || typeof item.studentId !== "string") return false;
+  // Placements also have studentId + studentName. Treating them as registrations
+  // replaced real choices with empty shells and looked like deleted records.
+  if (
+    typeof item.slotNumber === "number" &&
+    Object.prototype.hasOwnProperty.call(item, "placedActivityId") &&
+    !item.slot1Choice &&
+    !item.slot2Choice &&
+    !item.slot3Choice
+  ) {
+    return false;
+  }
   return (
-    item &&
-    typeof item === "object" &&
-    typeof item.studentId === "string" &&
-    (typeof item.slot1Choice === "string" ||
-      typeof item.firstChoice === "string" ||
-      typeof item.studentName === "string")
+    typeof item.slot1Choice === "string" ||
+    typeof item.slot2Choice === "string" ||
+    typeof item.slot3Choice === "string" ||
+    typeof item.firstChoice === "string" ||
+    typeof item.secondChoice === "string" ||
+    typeof item.thirdChoice === "string"
   );
 }
 
@@ -169,7 +182,9 @@ function isStudent(item: any): boolean {
 function resolveSchoolForRegistration(
   reg: any,
   schools: Record<string, SchoolData>,
-): string {
+): string | null {
+  const explicit = canonicalSchoolKey(reg.schoolId);
+  if (explicit && schools[explicit]) return explicit;
   if (reg.schoolId && schools[reg.schoolId]) return reg.schoolId;
   const choice = reg.slot1Choice || reg.slot2Choice || reg.slot3Choice || "";
   if (typeof choice === "string") {
@@ -177,20 +192,27 @@ function resolveSchoolForRegistration(
     if (choice.startsWith("YN")) return "sch-yitzhak-navon";
     if (choice.startsWith("BS")) return "sch-ben-shemen";
   }
-  return "sch-lapid-hmd";
+  return null;
 }
 
 function resolveSchoolForStudent(
   st: any,
   schools: Record<string, SchoolData>,
-): string {
+): string | null {
+  const explicit = canonicalSchoolKey(st.schoolId);
+  if (explicit && schools[explicit]) return explicit;
   if (st.schoolId && schools[st.schoolId]) return st.schoolId;
-  if (st.schoolName) {
+  if (st.schoolName && !isPersonName(st.schoolName)) {
     if (st.schoolName.includes("לפיד")) return "sch-lapid-hmd";
-    if (st.schoolName.includes("נבון")) return "sch-yitzhak-navon";
+    if (st.schoolName.includes("יצחק נבון") || st.schoolName.includes("נבון")) return "sch-yitzhak-navon";
     if (st.schoolName.includes("שמן")) return "sch-ben-shemen";
   }
-  return "sch-lapid-hmd";
+  return null;
+}
+
+function isPersonName(value: string): boolean {
+  const parts = String(value || "").trim().split(/\s+/).filter(Boolean);
+  return parts.length >= 2 && parts.every((part) => /^[\u0590-\u05FF'"״]+$/.test(part)) && !value.includes("בית");
 }
 
 function addRegistration(
@@ -199,7 +221,18 @@ function addRegistration(
   result: RecoveryScanResult,
   seen: Set<string>,
 ) {
-  if (!reg || !reg.studentId) return;
+  if (!reg || !reg.studentId || !schoolKey) return;
+  try {
+    const tombstones = typeof localStorage === "undefined" ? {} : readTombstones(localStorage);
+    if (
+      tombstones[tombKey(schoolKey, "registration", reg.id || "")] ||
+      tombstones[tombKey(schoolKey, "registrationStudent", String(reg.studentId).trim())]
+    ) {
+      return;
+    }
+  } catch {
+    // ignore storage access
+  }
   const key = `${schoolKey}_${reg.studentId.trim()}`;
   if (seen.has(key)) return;
   seen.add(key);
@@ -231,7 +264,13 @@ function addStudent(
   result: RecoveryScanResult,
   seen: Set<string>,
 ) {
-  if (!st || !st.id) return;
+  if (!st || !st.id || !schoolKey) return;
+  try {
+    const tombstones = typeof localStorage === "undefined" ? {} : readTombstones(localStorage);
+    if (tombstones[tombKey(schoolKey, "student", String(st.id).trim())]) return;
+  } catch {
+    // ignore storage access
+  }
   const key = `${schoolKey}_${st.id.trim()}`;
   if (seen.has(key)) return;
   seen.add(key);

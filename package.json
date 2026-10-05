@@ -8,7 +8,8 @@
     "build": "vite build",
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",
-    "lint": "tsc --noEmit"
+    "lint": "tsc --noEmit",
+    "test": "esbuild src/services/dataSafety.test.ts --bundle --platform=node --format=cjs --outfile=node_modules/.cache/dataSafety.test.cjs --loader:.jpg=text --loader:.jpeg=text --loader:.png=text --loader:.svg=text --loader:.webp=text && node node_modules/.cache/dataSafety.test.cjs"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",

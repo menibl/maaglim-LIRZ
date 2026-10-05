@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useEffect } from "react";
+import React, { useState, useMemo, useEffect, useRef } from "react";
 import {
   useSchool,
   StudentImportMode,
@@ -16,6 +16,8 @@ import {
   CATEGORY_HEBREW_MAP,
 } from "../../services/excelService";
 import { Student, Activity, Registration } from "../../types";
+import { SchoolData } from "../../data/initialData";
+import { buildBackupPayload, parseBackupJson, readFileText } from "../../services/dataSafety";
 import {
   UploadCloud,
   FileSpreadsheet,
@@ -64,6 +66,7 @@ export const ExcelImportModal: React.FC<ExcelImportModalProps> = ({
     importActivities,
     importRegistrations,
     importFullWorkbook,
+    restoreFullBackup,
   } = useSchool();
 
   const [activeSubTab, setActiveSubTab] = useState<"export" | "import">(
@@ -99,6 +102,8 @@ export const ExcelImportModal: React.FC<ExcelImportModalProps> = ({
   const [studentGradeFilter, setStudentGradeFilter] = useState<string>("all");
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
+  const [parsedBackupSchools, setParsedBackupSchools] = useState<Record<string, SchoolData> | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   // Sync tab and reset state whenever opened
   useEffect(() => {
@@ -117,6 +122,7 @@ export const ExcelImportModal: React.FC<ExcelImportModalProps> = ({
       setParsedStudents(null);
       setParsedActivities(null);
       setParsedRegistrations(null);
+      setParsedBackupSchools(null);
       setErrorMessage(null);
       setSuccessMessage(null);
       setIsProcessing(false);
@@ -141,15 +147,42 @@ export const ExcelImportModal: React.FC<ExcelImportModalProps> = ({
     setParsedStudents(null);
     setParsedActivities(null);
     setParsedRegistrations(null);
+    setParsedBackupSchools(null);
     setStudentSchoolFilter("all");
     setStudentGradeFilter("all");
     setSelectedDeleteIds({});
     setSelectedDeleteActivityIds({});
 
+    const fileName = selectedFile.name.toLowerCase();
+    if (fileName.endsWith(".json") || selectedFile.type.includes("json")) {
+      try {
+        const text = await readFileText(selectedFile);
+        const backup = parseBackupJson(text);
+        setIsProcessing(false);
+        if (!backup) {
+          setErrorMessage("קובץ ה-JSON אינו גיבוי מלא של מעגלים. ייצאו גיבוי חדש מהמערכת ונסו שוב.");
+          return;
+        }
+        setParsedBackupSchools(backup as Record<string, SchoolData>);
+        const summaries = Object.values(backup);
+        const studentCount = summaries.reduce((sum, school) => sum + (school.students?.length || 0), 0);
+        const activityCount = summaries.reduce((sum, school) => sum + (school.activities?.length || 0), 0);
+        const registrationCount = summaries.reduce((sum, school) => sum + (school.registrations?.length || 0), 0);
+        setImportTarget("full_workbook");
+        setSuccessMessage(
+          `גיבוי מלא נקרא בהצלחה מ-${Object.keys(backup).length} בתי ספר: ${studentCount} תלמידים, ${activityCount} חוגים, ${registrationCount} נרשמים. לחצו על קליטה כדי לשמור אותו.`,
+        );
+      } catch (error: any) {
+        setIsProcessing(false);
+        setErrorMessage(error?.message || "לא ניתן לקרוא את קובץ הגיבוי. אם הוא פתוח בחלון אחר, סגרו אותו ונסו שוב.");
+      }
+      return;
+    }
+
     const result = await parseExcelFile(
       selectedFile,
       currentSchoolId,
-      target === "full_workbook" ? "auto" : target,
+      target === "full_workbook" ? "full_workbook" : target,
       activities,
     );
     setIsProcessing(false);
@@ -224,11 +257,18 @@ export const ExcelImportModal: React.FC<ExcelImportModalProps> = ({
   };
 
   const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const selected = e.target.files?.[0];
+    const input = e.target;
+    const selected = input.files?.[0];
     if (!selected) return;
 
     setFile(selected);
-    await processFile(selected, importTarget);
+    try {
+      await processFile(selected, importTarget);
+    } finally {
+      // Reset after the read so the same file can be chosen again,
+      // without invalidating the File object mid-read.
+      input.value = "";
+    }
   };
 
   // Compute school breakdown for parsed students
@@ -444,6 +484,19 @@ export const ExcelImportModal: React.FC<ExcelImportModalProps> = ({
   };
 
   const handleApplyImport = () => {
+    if (parsedBackupSchools) {
+      const res = restoreFullBackup(parsedBackupSchools);
+      setSuccessMessage(
+        res.success
+          ? `הגיבוי המלא נקלט: ${res.students} תלמידים ו-${res.registrations} נרשמים מ-${res.schools} בתי ספר. הרשומות מוזגו עם מה שכבר קיים ולא נדרסו.`
+          : "לא נמצאו בתי ספר תקינים בקובץ הגיבוי.",
+      );
+      if (res.success) {
+        setTimeout(() => onClose(), 2200);
+      }
+      return;
+    }
+
     if (importTarget === "full_workbook") {
       const res = importFullWorkbook({
         students: parsedStudents || undefined,
@@ -788,22 +841,47 @@ export const ExcelImportModal: React.FC<ExcelImportModalProps> = ({
                     שישי, רישומי הורים ושיבוצים.
                   </div>
                 </div>
-                <button
-                  type="button"
-                  onClick={() =>
-                    exportFullSchoolWorkbook(
-                      currentSchool,
-                      students,
-                      activities,
-                      registrations,
-                      placements,
-                    )
-                  }
-                  className="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold rounded-xl transition-colors flex items-center gap-1.5 shrink-0 shadow-xs cursor-pointer"
-                >
-                  <Download className="w-4 h-4" />
-                  <span>ייצוא דוח מלא (4 גיליונות)</span>
-                </button>
+                <div className="flex flex-col sm:flex-row gap-2 shrink-0">
+                  <button
+                    type="button"
+                    onClick={() =>
+                      exportFullSchoolWorkbook(
+                        currentSchool,
+                        students,
+                        activities,
+                        registrations,
+                        placements,
+                      )
+                    }
+                    className="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold rounded-xl transition-colors flex items-center gap-1.5 shadow-xs cursor-pointer"
+                  >
+                    <Download className="w-4 h-4" />
+                    <span>ייצוא דוח מלא (4 גיליונות)</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const payload = buildBackupPayload(
+                        schools as Record<string, SchoolData>,
+                      );
+                      const blob = new Blob([JSON.stringify(payload)], {
+                        type: "application/json",
+                      });
+                      const url = URL.createObjectURL(blob);
+                      const link = document.createElement("a");
+                      link.href = url;
+                      link.download = `maagalim-backup-${new Date().toISOString().slice(0, 10)}.json`;
+                      document.body.appendChild(link);
+                      link.click();
+                      link.remove();
+                      URL.revokeObjectURL(url);
+                    }}
+                    className="px-4 py-2 bg-slate-900 hover:bg-slate-800 text-white text-xs font-bold rounded-xl transition-colors flex items-center gap-1.5 shadow-xs cursor-pointer"
+                  >
+                    <Download className="w-4 h-4" />
+                    <span>גיבוי JSON מלא (כל בתי הספר)</span>
+                  </button>
+                </div>
               </div>
 
               {/* Prompt to move to import tab */}
@@ -897,8 +975,9 @@ export const ExcelImportModal: React.FC<ExcelImportModalProps> = ({
                 </div>
               </div>
 
-              {/* Upload Dropzone */}
-              <label className="border-2 border-dashed border-indigo-300 hover:border-indigo-600 rounded-3xl p-8 text-center cursor-pointer transition-all bg-indigo-50/20 hover:bg-indigo-50/50 flex flex-col items-center justify-center gap-2.5 block">
+              {/* Upload Dropzone. The input stays in the document (not display:none)
+                  so Safari, Chrome and Firefox all deliver the selected file. */}
+              <div className="border-2 border-dashed border-indigo-300 hover:border-indigo-600 rounded-3xl p-8 text-center transition-all bg-indigo-50/20 hover:bg-indigo-50/50 flex flex-col items-center justify-center gap-2.5">
                 <div className="w-12 h-12 rounded-2xl bg-indigo-100 text-indigo-600 flex items-center justify-center shadow-inner">
                   <UploadCloud className="w-6 h-6 animate-pulse" />
                 </div>
@@ -906,19 +985,37 @@ export const ExcelImportModal: React.FC<ExcelImportModalProps> = ({
                   <span className="text-sm font-bold text-slate-900 block">
                     {file
                       ? file.name
-                      : "גררו לכאן את קובץ ה-Excel (.xlsx) או לחצו לבחירת קובץ"}
+                      : "בחרו קובץ גיבוי מלא (.json) או Excel (.xlsx)"}
                   </span>
                   <span className="text-xs text-slate-500 mt-1 block">
-                    המערכת מזהה אוטומטית קבצי שחזור מלא (Master עם נרשמים, זכאים וחוגים), קבצי חוגים, תלמידים זכאים ונרשמים
+                    אם הקובץ פתוח ב-Excel או בחלון אחר, סגרו אותו לפני ההעלאה. גיבוי JSON שומר את כל בתי הספר בלי לאבד מזהים.
                   </span>
                 </div>
+                <button
+                  type="button"
+                  onClick={() => fileInputRef.current?.click()}
+                  className="mt-1 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold rounded-xl cursor-pointer"
+                >
+                  בחירת קובץ גיבוי
+                </button>
                 <input
+                  ref={fileInputRef}
                   type="file"
-                  accept=".xlsx,.xls,.csv"
+                  accept=".xlsx,.xls,.xlsm,.csv,.json,application/json,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                   onChange={handleFileChange}
-                  className="hidden"
+                  style={{
+                    position: "absolute",
+                    width: 1,
+                    height: 1,
+                    padding: 0,
+                    margin: "-1px",
+                    overflow: "hidden",
+                    clip: "rect(0, 0, 0, 0)",
+                    whiteSpace: "nowrap",
+                    border: 0,
+                  }}
                 />
-              </label>
+              </div>
 
               {/* Import Mode Selector & Change Controls */}
               {parsedStudents && parsedStudents.length > 0 ? (
@@ -1958,7 +2055,10 @@ export const ExcelImportModal: React.FC<ExcelImportModalProps> = ({
               type="button"
               onClick={handleApplyImport}
               disabled={
-                !parsedStudents && !parsedActivities && !parsedRegistrations
+                !parsedBackupSchools &&
+                !parsedStudents &&
+                !parsedActivities &&
+                !parsedRegistrations
               }
               className={`px-6 py-2.5 active:scale-98 text-white text-xs font-bold rounded-xl shadow-md transition-all disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-2 cursor-pointer ${
                 importTarget === "full_workbook" ||
@@ -1970,7 +2070,9 @@ export const ExcelImportModal: React.FC<ExcelImportModalProps> = ({
             >
               <CheckCircle className="w-4 h-4" />
               <span>
-                {importTarget === "full_workbook" ||
+                {parsedBackupSchools
+                  ? `קלוט גיבוי JSON מלא (${Object.keys(parsedBackupSchools).length} בתי ספר)`
+                  : importTarget === "full_workbook" ||
                 (parsedStudents &&
                   (parsedRegistrations || parsedActivities))
                   ? `שחזר וקלוט את כל הנתונים למערכת ולענן (${parsedStudents?.length || 0} זכאים, ${parsedActivities?.length || 0} חוגים, ${parsedRegistrations?.length || 0} נרשמים)`

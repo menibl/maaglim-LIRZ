@@ -162,7 +162,7 @@ export const AdminDashboardView: React.FC = () => {
 
   const handleUploadLocalDataToCloud = async () => {
     const confirmUpload = window.confirm(
-      "פעולה זו תעלה ותשמור את כל נתוני המחשב שלך (כולל פרטי הרכזות המעודכנים ורשימת החוגים המעודכנת) ישירות לענן Firebase. כל 26 הנרשמים שכבר קיימים בענן יישמרו במלואם. האם להמשיך?",
+      "פעולה זו ממזגת את נתוני המחשב הזה לתוך הענן. רשומות שקיימות רק בענן נשמרות ולא נמחקות. להמשיך?",
     );
     if (!confirmUpload) return;
 

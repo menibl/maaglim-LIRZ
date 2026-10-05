@@ -1,4 +1,5 @@
 import * as XLSX from "xlsx";
+import { readFileArrayBuffer } from "./dataSafety";
 import {
   Student,
   Activity,
@@ -211,6 +212,8 @@ export function exportFullSchoolWorkbook(
     "תעודת זהות": s.id,
     "שם פרטי": s.firstName,
     "שם משפחה": s.lastName,
+    "מזהה בית ספר": s.schoolId || school.id,
+    "בית ספר": s.schoolName || school.name,
     כיתה: s.grade,
     שכבה: s.gradeLayer,
     "סטטוס אישור הרשמה": s.isAuthorized ? "מאושר" : "לא מאושר",
@@ -294,11 +297,17 @@ export function exportFullSchoolWorkbook(
       "שם הורה": r.parentName,
       "טלפון הורה": r.parentPhone,
       'דוא"ל הורה': r.parentEmail,
+      "משבצת 1 - מזהה חוג": r.slot1Choice || "",
       "משבצת 1 - חוג עיקרי": s1Main,
+      "משבצת 1 - מזהה חלופי": r.slot1Backup || "",
       "משבצת 1 - חוג חלופי": s1Back,
+      "משבצת 2 - מזהה חוג": r.slot2Choice || "",
       "משבצת 2 - חוג עיקרי": s2Main,
+      "משבצת 2 - מזהה חלופי": r.slot2Backup || "",
       "משבצת 2 - חוג חלופי": s2Back,
+      "משבצת 3 - מזהה חוג": r.slot3Choice || "",
       "משבצת 3 - חוג עיקרי": s3Main,
+      "משבצת 3 - מזהה חלופי": r.slot3Backup || "",
       "משבצת 3 - חוג חלופי": s3Back,
       "הערות הורה": r.notes || "",
     };
@@ -324,6 +333,7 @@ export function exportFullSchoolWorkbook(
       "שם מלא": p.studentName,
       כיתה: p.grade,
       "משבצת זמן": `משבצת ${p.slotNumber || 1}`,
+      "מזהה חוג": p.placedActivityId || "",
       "חוג משובץ": act,
       סטטוס: statusHeb,
       "עדיפות שהושגה": p.priorityAchieved
@@ -1136,16 +1146,30 @@ export const CANONICAL_SCHOOLS = {
   LAPID: { id: "sch-lapid-hmd", name: 'בית ספר לפיד המ"ד' },
 };
 
+function isPersonLikeName(value: string): boolean {
+  const parts = value.trim().split(/\s+/).filter(Boolean);
+  return (
+    parts.length >= 2 &&
+    parts.every((part) => /^[\u0590-\u05FF'"״]+$/.test(part)) &&
+    !value.includes("בית") &&
+    !value.includes("ספר")
+  );
+}
+
 export function canonicalizeSchoolId(rawIdOrName: string | undefined): string {
   if (!rawIdOrName) return "sch-ben-shemen";
   const str = String(rawIdOrName).trim();
   if (
-    str === "sch-ben-shemen" ||
-    str === "sch-yitzhak-navon" ||
     str === "sch-lapid-hmd" ||
-    str === "sch-lapid"
+    str === "sch-lapid" ||
+    str === "lapid" ||
+    str === "sch-lapid-hamah" ||
+    str === "sch-lapid-hamad"
   ) {
-    return str === "sch-lapid" ? "sch-lapid-hmd" : str;
+    return "sch-lapid-hmd";
+  }
+  if (str === "sch-ben-shemen" || str === "sch-yitzhak-navon") {
+    return str;
   }
   const clean = str
     .toLowerCase()
@@ -1159,20 +1183,18 @@ export function canonicalizeSchoolId(rawIdOrName: string | undefined): string {
   ) {
     return "sch-ben-shemen";
   }
-  if (clean.includes("נבון") || clean.includes("navon")) {
-    return "sch-yitzhak-navon";
-  }
   if (
+    clean === "schlapidhmd" ||
     clean.includes("לפיד") ||
-    clean.includes("המה") ||
-    clean.includes("המד") ||
     clean.includes("lapid")
   ) {
     return "sch-lapid-hmd";
   }
+  if (clean.includes("נבון") || clean.includes("navon")) {
+    return "sch-yitzhak-navon";
+  }
   if (str === "ben-shemen") return "sch-ben-shemen";
   if (str === "yitzhak-navon") return "sch-yitzhak-navon";
-  if (str === "lapid" || str === "sch-lapid") return "sch-lapid-hmd";
   return str.startsWith("sch-") ? str : `sch-${str}`;
 }
 
@@ -1216,23 +1238,25 @@ export function extractSchoolFromText(
       return { schoolId: "sch-ben-shemen", schoolName: "בית ספר בן שמן" };
     }
 
+    // A two-word personal name such as "דנה נבון" is not a school label.
+    if (isPersonLikeName(candidate) && !candidate.includes("יצחק נבון")) {
+      continue;
+    }
+
     // Check Yitzhak Navon (יצחק נבון)
     if (
-      clean.includes("נבון") ||
+      clean.includes("יצחק נבון") ||
+      clean.includes("יצחקנבון") ||
+      clean === "נבון" ||
       clean.includes("navon") ||
-      clean === "יצחק נבון" ||
-      clean === "יצחקנבון"
+      (clean.includes("נבון") && (clean.includes("בית") || clean.includes("ספר") || clean.length <= 8))
     ) {
       return { schoolId: "sch-yitzhak-navon", schoolName: "בית ספר יצחק נבון" };
     }
 
-    // Check Lapid HaM"H (לפיד המ"ד)
+    // לפיד matches the school. A bare "המד" also matches words such as "המדריך".
     if (
       clean.includes("לפיד") ||
-      clean.includes("המה") ||
-      clean.includes("המד") ||
-      clean.includes("ה מה") ||
-      clean.includes("ה מד") ||
       clean.includes("lapid") ||
       clean === "לפיד"
     ) {
@@ -1266,9 +1290,12 @@ export function detectSchoolFromRow(
 ): DetectedSchoolResult {
   const canonicalFallback = canonicalizeSchoolId(fallbackSchoolId);
 
-  // 1. DIRECT CHECK OF COLUMN J (10th column, index 9)
-  // Check raw Column J captured from 2D array:
+  // 1. Column J is a school column only when its header says so.
+  // In the full backup export, column J is the settlement (יישוב), not the school.
+  const headerJ = Array.isArray(row.__headerRow) ? String(row.__headerRow[9] || "") : "";
+  const columnJIsSchool = /בית\s*ספר|ביה|מוסד|שלוחה|school/i.test(headerJ);
   if (
+    columnJIsSchool &&
     row.__rawColJ !== undefined &&
     row.__rawColJ !== null &&
     String(row.__rawColJ).trim() !== ""
@@ -1283,22 +1310,23 @@ export function detectSchoolFromRow(
     }
   }
 
-  // Check common Column J aliases in sheet_to_json:
-  const colJCandidates = [row["__EMPTY_9"], row["J"], row["j"]];
+  // Named Column J aliases only count when the header itself is a school column.
   const rowKeys = Object.keys(row);
-  if (rowKeys.length > 9) {
-    colJCandidates.push(row[rowKeys[9]]);
-  }
-
-  for (const val of colJCandidates) {
-    if (val !== undefined && val !== null && String(val).trim() !== "") {
-      const detected = extractSchoolFromText(val);
-      if (detected) {
-        return {
-          ...detected,
-          isExplicitlyDetected: true,
-          detectionSource: "עמודה J",
-        };
+  if (columnJIsSchool) {
+    const colJCandidates = [row["__EMPTY_9"], row["J"], row["j"]];
+    if (rowKeys.length > 9) {
+      colJCandidates.push(row[rowKeys[9]]);
+    }
+    for (const val of colJCandidates) {
+      if (val !== undefined && val !== null && String(val).trim() !== "") {
+        const detected = extractSchoolFromText(val);
+        if (detected) {
+          return {
+            ...detected,
+            isExplicitlyDetected: true,
+            detectionSource: "עמודה J",
+          };
+        }
       }
     }
   }
@@ -1329,6 +1357,8 @@ export function detectSchoolFromRow(
     "מסגרת",
     "שלוחה",
     "שם שלוחה",
+    "מזהה בית ספר",
+    "schoolId",
     "school",
     "schoolName",
     "school_name",
@@ -1368,45 +1398,10 @@ export function detectSchoolFromRow(
     }
   }
 
-  // 4. Scan all cell values in the student's row
-  const cellValues = row.__rowValues || Object.values(row);
-  for (const val of cellValues) {
-    if (typeof val === "string" && val.trim()) {
-      const detected = extractSchoolFromText(val);
-      if (detected) {
-        return {
-          ...detected,
-          isExplicitlyDetected: true,
-          detectionSource: "תוכן שורת תלמיד",
-        };
-      }
-    }
-  }
+  // Do not scan free-text cells or notes. A parent named "נבון" or a settlement
+  // of "לפיד" would otherwise be treated as the school and the real row deleted.
 
-  // 5. Secondary registration / activity context
-  const contextField = findFieldValue(row, [
-    "שם חוג",
-    "שם החוג",
-    "קבוצה",
-    "תיאור קבוצה",
-    "מסלול",
-    "שלוחה",
-    "הערות",
-    "הערות מיוחדות",
-  ]);
-
-  if (contextField) {
-    const detected = extractSchoolFromText(contextField);
-    if (detected) {
-      return {
-        ...detected,
-        isExplicitlyDetected: true,
-        detectionSource: "הקשר רישום / הערות",
-      };
-    }
-  }
-
-  // 6. Sheet name context
+  // 4. Sheet name context
   if (sheetName) {
     const detected = extractSchoolFromText(sheetName);
     if (detected) {
@@ -2346,15 +2341,18 @@ export function parseRegistrationsSheet(
         k.includes("שעה ראשונה") ||
         k.includes("slot1")
       ) {
-        if (
+        const isBackup =
           k.includes("חלופי") ||
           k.includes("גיבוי") ||
           k.includes("עדיפות 2") ||
           k.includes("backup") ||
-          k.includes("משני")
-        ) {
-          slot1Backup = v;
-        } else {
+          k.includes("משני");
+        if (k.includes("מזהה")) {
+          if (isBackup) slot1Backup = v;
+          else slot1Choice = v;
+        } else if (isBackup) {
+          if (!slot1Backup) slot1Backup = v;
+        } else if (!slot1Choice) {
           slot1Choice = v;
         }
       } else if (
@@ -2365,15 +2363,18 @@ export function parseRegistrationsSheet(
         k.includes("שעה שנייה") ||
         k.includes("slot2")
       ) {
-        if (
+        const isBackup =
           k.includes("חלופי") ||
           k.includes("גיבוי") ||
           k.includes("עדיפות 2") ||
           k.includes("backup") ||
-          k.includes("משני")
-        ) {
-          slot2Backup = v;
-        } else {
+          k.includes("משני");
+        if (k.includes("מזהה")) {
+          if (isBackup) slot2Backup = v;
+          else slot2Choice = v;
+        } else if (isBackup) {
+          if (!slot2Backup) slot2Backup = v;
+        } else if (!slot2Choice) {
           slot2Choice = v;
         }
       } else if (
@@ -2383,15 +2384,18 @@ export function parseRegistrationsSheet(
         k.includes("שעה שלישית") ||
         k.includes("slot3")
       ) {
-        if (
+        const isBackup =
           k.includes("חלופי") ||
           k.includes("גיבוי") ||
           k.includes("עדיפות 2") ||
           k.includes("backup") ||
-          k.includes("משני")
-        ) {
-          slot3Backup = v;
-        } else {
+          k.includes("משני");
+        if (k.includes("מזהה")) {
+          if (isBackup) slot3Backup = v;
+          else slot3Choice = v;
+        } else if (isBackup) {
+          if (!slot3Backup) slot3Backup = v;
+        } else if (!slot3Choice) {
           slot3Choice = v;
         }
       } else if (k.includes("הערות") || k.includes("notes")) {
@@ -2456,20 +2460,33 @@ export async function parseExcelFile(
     | "auto" = "auto",
   availableActivities: Activity[] = [],
 ): Promise<ParseExcelResult> {
-  const getArrayBuffer = async (): Promise<ArrayBuffer> => {
-    if (typeof file.arrayBuffer === "function") {
-      return await file.arrayBuffer();
-    }
-    return new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = (e) => resolve(e.target?.result as ArrayBuffer);
-      reader.onerror = (e) => reject(e);
-      reader.readAsArrayBuffer(file);
-    });
-  };
-
   try {
-    const arrayBuf = await getArrayBuffer();
+    const arrayBuf = await readFileArrayBuffer(file);
+    return parseExcelArrayBuffer(
+      arrayBuf,
+      fallbackSchoolId,
+      expectedType,
+      availableActivities,
+    );
+  } catch (err: any) {
+    return {
+      error: err?.message || "לא ניתן לקרוא את הקובץ. אם הוא פתוח בחלון אחר, סגרו אותו ונסו שוב.",
+    };
+  }
+}
+
+export function parseExcelArrayBuffer(
+  arrayBuf: ArrayBuffer,
+  fallbackSchoolId: string = "sch-ben-shemen",
+  expectedType:
+    | "students"
+    | "activities"
+    | "registrations"
+    | "full_workbook"
+    | "auto" = "auto",
+  availableActivities: Activity[] = [],
+): ParseExcelResult {
+  try {
     const data = new Uint8Array(arrayBuf);
     const workbook = XLSX.read(data, { type: "array" });
 
@@ -2507,35 +2524,41 @@ export async function parseExcelFile(
       };
     });
 
+    const isPlacementSheet = (name: string) => {
+      const lower = name.toLowerCase();
+      return lower.includes("placement") || name.includes("שיבוץ");
+    };
+    const contentSheets = sheetProfiles.filter((p) => !isPlacementSheet(p.sheetName));
+
     // 1. Try to find the best activities sheet
     const bestActivitySheet =
-      sheetProfiles.find(
+      contentSheets.find(
         (p) =>
           p.analysis.type === "activities" ||
           (p.hasActivityName && p.analysis.activityScore > 0),
       ) ||
-      sheetProfiles.find((p) => p.analysis.activityScore >= 6) ||
-      sheetProfiles.find((p) => p.hasActivityName);
+      contentSheets.find((p) => p.analysis.activityScore >= 6) ||
+      contentSheets.find((p) => p.hasActivityName);
 
     // 2. Try to find the best students sheet
     const bestStudentSheet =
-      sheetProfiles.find(
+      contentSheets.find(
         (p) =>
           p.analysis.type === "students" ||
           (p.hasStudentName && p.analysis.studentScore > 0),
       ) ||
-      sheetProfiles.find((p) => p.analysis.studentScore >= 6) ||
-      sheetProfiles.find((p) => p.hasStudentName);
+      contentSheets.find((p) => p.analysis.studentScore >= 6) ||
+      contentSheets.find((p) => p.hasStudentName);
 
     // 3. Try to find the best registrations sheet
     const bestRegistrationSheet =
-      sheetProfiles.find(
+      contentSheets.find(
         (p) =>
           p.analysis.type === "registrations" ||
           (p.hasRegistrationName && p.analysis.registrationScore > 0),
       ) ||
-      sheetProfiles.find((p) => p.analysis.registrationScore >= 6) ||
-      sheetProfiles.find((p) => p.hasRegistrationName);
+      contentSheets.find((p) => p.analysis.registrationScore >= 6) ||
+      contentSheets.find((p) => p.hasRegistrationName);
 
     // Helper: parse activities from target sheet
     const parseActsFromSheet = (): Activity[] => {
@@ -2574,7 +2597,7 @@ export async function parseExcelFile(
     const hasMultipleTypes =
       (bestRegistrationSheet && (bestStudentSheet || bestActivitySheet)) ||
       (bestStudentSheet && bestActivitySheet) ||
-      workbook.SheetNames.length >= 3;
+      contentSheets.length >= 3;
 
     if (expectedType === "full_workbook" || (expectedType === "auto" && hasMultipleTypes)) {
       const acts = parseActsFromSheet();
@@ -2591,12 +2614,26 @@ export async function parseExcelFile(
         registrationCount: regs.length,
       };
 
-      // If at least 2 categories or registrations found, it's a full workbook!
+      // An explicit full-backup upload must return every sheet that parsed,
+      // even when one of them is empty. Auto mode still requires real rows.
       if (
+        expectedType === "full_workbook" ||
         regs.length > 0 ||
-        (students.length > 0 && acts.length > 0) ||
-        expectedType === "full_workbook"
+        (students.length > 0 && acts.length > 0)
       ) {
+        if (
+          expectedType === "full_workbook" &&
+          students.length === 0 &&
+          acts.length === 0 &&
+          regs.length === 0
+        ) {
+          return {
+            detectedType: "full_workbook",
+            sheetsSummary: summary,
+            error:
+              "הקובץ נפתח, אבל לא נמצאו בו תלמידים, חוגים או נרשמים. ודאו שזהו קובץ הגיבוי המלא (Excel או JSON) ולא קובץ ריק.",
+          };
+        }
         return {
           students,
           activities: acts,
