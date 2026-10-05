@@ -1,0 +1,42 @@
+{
+  "entities": {
+    "systemSettings": {
+      "title": "System Settings",
+      "description": "Global application configuration such as system-wide logo and general settings",
+      "type": "object",
+      "properties": {
+        "customLogo": { "type": "string", "description": "Base64 or URL of the global logo" },
+        "updatedAt": { "type": "string", "description": "ISO timestamp of last update" }
+      }
+    },
+    "schools": {
+      "title": "Schools",
+      "description": "School information, configuration, coordinators, activities, students, and registrations",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "subtitle": { "type": "string" },
+        "logo": { "type": "string" },
+        "coordinator": { "type": "object" },
+        "activities": { "type": "array" },
+        "registrations": { "type": "array" },
+        "students": { "type": "array" },
+        "fridaySlots": { "type": "array" },
+        "waitlist": { "type": "array" },
+        "updatedAt": { "type": "string" }
+      },
+      "required": ["id", "name"]
+    }
+  },
+  "firestore": {
+    "/settings/global": {
+      "entity": "systemSettings",
+      "description": "Global application settings and default logo"
+    },
+    "/schools/{schoolId}": {
+      "entity": "schools",
+      "description": "Data for a specific school"
+    }
+  }
+}
