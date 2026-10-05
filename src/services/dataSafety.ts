@@ -543,9 +543,137 @@ export function hydrateSchools(
   return applyTombstonesToSchools(schools, tombstones);
 }
 
+export interface AdoptCloudOptions {
+  tombstones?: Record<string, string>;
+  /** ISO time of the Firestore document. Local rows newer than this are still in flight. */
+  cloudUpdatedAt?: string;
+  pendingRegistrations?: Registration[];
+  pendingPlacements?: Placement[];
+}
+
+/**
+ * Make a Firestore school document the visible state.
+ * Writes still union with the server so a stale window cannot delete rows it
+ * has not seen. Reads do the opposite: another browser must show the document,
+ * not its own older localStorage copy.
+ * A registration that has not reached the server yet (pending queue, or a
+ * timestamp newer than this snapshot) is kept on top.
+ */
+export function adoptCloudSchool(
+  local: Partial<SchoolSnapshot> | null | undefined,
+  cloud: Partial<SchoolSnapshot> | null | undefined,
+  options: AdoptCloudOptions = {},
+): SchoolSnapshot {
+  const id =
+    canonicalSchoolKey(cloud?.school?.id || local?.school?.id || "") ||
+    cloud?.school?.id ||
+    local?.school?.id ||
+    LAPID_SCHOOL_ID;
+  const tombstones = options.tombstones || {};
+  const cloudTime = Date.parse(options.cloudUpdatedAt || "") || 0;
+  const hidden = (key: string) => !!key && !!tombstones[key];
+
+  const students = (cloud?.students || []).filter(
+    (student) => student?.id && !hidden(tombKey(id, "student", student.id)),
+  );
+
+  const registrations = new Map<string, Registration>();
+  const rememberRegistration = (reg: Registration | null | undefined) => {
+    if (!reg) return;
+    const key = reg.studentId || reg.id;
+    if (!key) return;
+    if (
+      hidden(tombKey(id, "registration", reg.id)) ||
+      hidden(tombKey(id, "registrationStudent", reg.studentId)) ||
+      hidden(tombKey(id, "student", reg.studentId))
+    ) {
+      return;
+    }
+    const current = registrations.get(key);
+    registrations.set(key, current ? preferRegistration(current, reg) : reg);
+  };
+  (cloud?.registrations || []).forEach((reg) => rememberRegistration(reg));
+  (local?.registrations || []).forEach((reg) => {
+    const localTime = Date.parse(reg?.timestamp || "") || 0;
+    if (cloudTime && localTime > cloudTime) rememberRegistration(reg);
+  });
+  (options.pendingRegistrations || []).forEach((reg) => rememberRegistration(reg));
+
+  const placements = new Map<string, Placement>();
+  const rememberPlacement = (placement: Placement | null | undefined) => {
+    if (!placement) return;
+    const key = placement.id || `${placement.studentId}-${placement.slotNumber}`;
+    if (!key) return;
+    if (
+      hidden(tombKey(id, "placement", placement.id)) ||
+      hidden(tombKey(id, "student", placement.studentId))
+    ) {
+      return;
+    }
+    const current = placements.get(key);
+    placements.set(key, current ? preferPlacement(current, placement) : placement);
+  };
+  (cloud?.placements || []).forEach((placement) => rememberPlacement(placement));
+  (local?.placements || []).forEach((placement) => {
+    const localTime = Date.parse(placement?.placedAt || "") || 0;
+    if (cloudTime && localTime > cloudTime) rememberPlacement(placement);
+  });
+  (options.pendingPlacements || []).forEach((placement) => rememberPlacement(placement));
+
+  const activities = (cloud?.activities || []).filter(
+    (activity) => activity?.id && !hidden(tombKey(id, "activity", activity.id)),
+  );
+
+  return {
+    school: {
+      ...(cloud?.school || local?.school || ({} as School)),
+      id,
+    },
+    students,
+    activities,
+    registrations: Array.from(registrations.values()),
+    placements: Array.from(placements.values()),
+  };
+}
+
+export function adoptCloudSchools(
+  localSchools: Record<string, SchoolSnapshot>,
+  cloudSchools: Record<string, SchoolSnapshot>,
+  tombstonesBySchool?: Record<string, Record<string, string>>,
+  optionsBySchool?: Record<string, Omit<AdoptCloudOptions, "tombstones">>,
+): Record<string, SchoolSnapshot> {
+  const adopted: Record<string, SchoolSnapshot> = {};
+  Object.entries(cloudSchools || {}).forEach(([rawId, cloud]) => {
+    if (!cloud) return;
+    const id = canonicalSchoolKey(cloud.school?.id || rawId) || rawId;
+    const local = localSchools?.[id] || localSchools?.[rawId];
+    const tombstones = {
+      ...(tombstonesBySchool?.[id] || {}),
+      ...(tombstonesBySchool?.[rawId] || {}),
+    };
+    const extra = optionsBySchool?.[id] || optionsBySchool?.[rawId] || {};
+    const next = adoptCloudSchool(local, cloud, { ...extra, tombstones });
+    adopted[id] = adopted[id] ? mergeSchoolSnapshot(adopted[id], next, { tombstones }).data : next;
+  });
+  return adopted;
+}
+
+export function flattenTombstones(
+  tombstonesBySchool: Record<string, Record<string, string>> | null | undefined,
+): Record<string, string> {
+  const flat: Record<string, string> = {};
+  Object.values(tombstonesBySchool || {}).forEach((marks) => {
+    Object.entries(marks || {}).forEach(([key, at]) => {
+      if (!flat[key] || Date.parse(at) > Date.parse(flat[key] || "")) flat[key] = at;
+    });
+  });
+  return flat;
+}
+
 export function persistSchoolsSnapshot(
   storage: StorageLike | null | undefined,
   schools: Record<string, SchoolSnapshot>,
+  options?: { authoritative?: boolean },
 ) {
   if (!storage) return;
   const tombstones = readTombstones(storage);
@@ -557,8 +685,18 @@ export function persistSchoolsSnapshot(
   }
   try {
     const previous = parseSchoolsBlob(storage.getItem(STORAGE_KEY));
-    if (previous && payload && isUnexplainedShrink(previous, schools, tombstones)) {
+    if (
+      !options?.authoritative &&
+      previous &&
+      payload &&
+      isUnexplainedShrink(previous, schools, tombstones)
+    ) {
       storage.setItem(SAFETY_SNAPSHOT_KEY, JSON.stringify(previous));
+    }
+    if (options?.authoritative && payload) {
+      // The cloud document is the copy to restore. The previous local blob
+      // must not be unioned back on the next page load.
+      storage.setItem(SAFETY_SNAPSHOT_KEY, payload);
     }
   } catch {
     // Ignore safety-copy failures.

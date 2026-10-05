@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import * as XLSX from "xlsx";
 import {
+  adoptCloudSchool,
+  adoptCloudSchools,
   canonicalSchoolKey,
   hydrateSchools,
   isUnexplainedShrink,
@@ -346,8 +348,97 @@ function testFullWorkbookRoundTrip() {
   void lapid;
 }
 
+function testSecondBrowserConvergesToCloud() {
+  const cloudUpdatedAt = "2026-10-05T12:00:00.000Z";
+  const cloud = snapshot(
+    "sch-lapid-hmd",
+    [
+      registration({
+        studentId: "111",
+        slot1Choice: "LPD-ACT-NEW-S1",
+        timestamp: cloudUpdatedAt,
+        studentName: "דנה לוי",
+      }),
+    ],
+    [student("111", "לוי"), student("333", "חדש")],
+  );
+  const browserB = snapshot(
+    "sch-lapid-hmd",
+    [
+      registration({
+        studentId: "111",
+        slot1Choice: "LPD-ACT-OLD-S1",
+        timestamp: "2026-10-01T00:00:00.000Z",
+        studentName: "דנה כהן",
+      }),
+      registration({
+        studentId: "222",
+        slot1Choice: "LPD-ACT-LOCAL-S1",
+        timestamp: "2026-10-02T00:00:00.000Z",
+      }),
+    ],
+    [student("111", "כהן"), student("222", "מקומי")],
+  );
+
+  const viewed = adoptCloudSchool(browserB, cloud, { cloudUpdatedAt });
+  assert.deepEqual(viewed.students.map((item) => item.id).sort(), ["111", "333"]);
+  assert.equal(viewed.students.find((item) => item.id === "111")?.lastName, "לוי");
+  assert.equal(viewed.registrations.length, 1);
+  assert.equal(viewed.registrations[0].slot1Choice, "LPD-ACT-NEW-S1");
+
+  const otherSchool = snapshot("sch-ben-shemen", [
+    registration({ studentId: "999", slot1Choice: "BS-ACT-A-S1" }),
+  ]);
+  const both = adoptCloudSchools(
+    { "sch-lapid-hmd": browserB, "sch-ben-shemen": otherSchool },
+    { "sch-lapid-hmd": cloud },
+    {},
+    { "sch-lapid-hmd": { cloudUpdatedAt } },
+  );
+  assert.equal(both["sch-ben-shemen"], undefined);
+  assert.equal(both["sch-lapid-hmd"].registrations[0].slot1Choice, "LPD-ACT-NEW-S1");
+
+  const inFlight = snapshot(
+    "sch-lapid-hmd",
+    [
+      registration({
+        studentId: "111",
+        slot1Choice: "LPD-ACT-TYPING-S1",
+        timestamp: "2026-10-05T12:00:05.000Z",
+      }),
+    ],
+    [student("111", "כהן")],
+  );
+  const duringEdit = adoptCloudSchool(inFlight, cloud, { cloudUpdatedAt });
+  assert.equal(duringEdit.registrations[0].slot1Choice, "LPD-ACT-TYPING-S1");
+  assert.equal(duringEdit.students.find((item) => item.id === "111")?.lastName, "לוי");
+
+  const pending = adoptCloudSchool(browserB, cloud, {
+    cloudUpdatedAt,
+    pendingRegistrations: [
+      registration({
+        studentId: "444",
+        slot1Choice: "LPD-ACT-PEND-S1",
+        timestamp: "2026-10-05T12:00:06.000Z",
+      }),
+    ],
+  });
+  assert.equal(pending.registrations.some((reg) => reg.studentId === "444"), true);
+  assert.equal(pending.registrations.some((reg) => reg.studentId === "222"), false);
+
+  const storage = memoryStorage();
+  persistSchoolsSnapshot(storage, { "sch-lapid-hmd": browserB });
+  persistSchoolsSnapshot(storage, { "sch-lapid-hmd": viewed }, { authoritative: true });
+  const hydrated = hydrateSchools(storage, {});
+  assert.deepEqual(
+    hydrated["sch-lapid-hmd"].students.map((item) => item.id).sort(),
+    ["111", "333"],
+  );
+}
+
 testMergeKeepsServerOnlyRecords();
 testEmptyShellDoesNotWipeChoices();
+testSecondBrowserConvergesToCloud();
 testIntentionalDeleteStaysDeleted();
 testUndefinedDeleteListDoesNotEraseComputedDeletes();
 testSafetySnapshotRestoresUnexplainedLoss();
