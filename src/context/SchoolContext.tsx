@@ -24,13 +24,7 @@ import {
   OFFICIAL_MASTER_ACTIVITIES,
   getOfficialActivitiesForSchool,
 } from "../data/initialData";
-import {
-  BACKUP_LAPID_REGISTRATIONS,
-  BACKUP_NAVON_REGISTRATIONS,
-  BACKUP_LAPID_STUDENTS,
-  BACKUP_NAVON_STUDENTS,
-  generatePlacementsForRegistrations,
-} from "../data/savedRegistrationsBackup";
+import { generatePlacementsForRegistrations } from "../data/savedRegistrationsBackup";
 import { deepScanBrowserForData } from "../utils/browserRecovery";
 import {
   runMatchingAlgorithm,
@@ -68,7 +62,6 @@ import {
   saveAllSchoolsToFirestore,
   saveCoordinatorToFirestore,
   saveActivitiesToFirestore,
-  saveStudentsToFirestore,
   saveRegistrationToFirestore,
   deleteRegistrationFromFirestore,
   updateRegistrationInFirestore,
@@ -80,8 +73,26 @@ import {
   getLastSyncError,
   CloudSyncStatus,
 } from "../services/firestoreService";
+import {
+  STORAGE_KEY,
+  MergeOptions,
+  SchoolSnapshot,
+  canonicalSchoolKey,
+  diffDeletions,
+  foldAliasSchools,
+  forgetTombstoneKeys,
+  hydrateSchools,
+  mergeDefinedOptions,
+  mergeSchoolSnapshot,
+  persistSchoolsSnapshot,
+  preferRegistration,
+  readTombstones,
+  rememberTombstoneKeys,
+  tombKey,
+  tombstoneKeysForDeletions,
+  writeTombstones,
+} from "../services/dataSafety";
 
-const STORAGE_KEY = "school_activities_system_data_v12_matched_images_kids";
 const CURRENT_SCHOOL_KEY = "school_activities_current_id_v12";
 const ADMIN_AUTH_KEY = "maagalim_admin_auth_session";
 const PERSISTENT_LOGO_KEY = "maagalim_brand_persistent_custom_logo";
@@ -234,6 +245,7 @@ interface SchoolContextType {
     students?: Student[];
     activities?: Activity[];
     registrations?: Registration[];
+    placements?: Placement[];
     targetSchoolId?: string;
   }) => { success: boolean; studentsCount: number; regsCount: number; actsCount: number };
 
@@ -256,59 +268,42 @@ interface SchoolContextType {
   refreshFromCloud: () => Promise<{ success: boolean; error?: string }>;
   uploadLocalDataToCloud: () => Promise<{ success: boolean; error?: string }>;
   executeDeepCacheRecovery: () => { registrationsRecovered: number; studentsRecovered: number };
+  restoreFullBackup: (incoming: Record<string, SchoolData>) => {
+    success: boolean;
+    schools: number;
+    registrations: number;
+    students: number;
+  };
 }
 
 const SchoolContext = createContext<SchoolContextType | null>(null);
 
-const mergeSchoolData = (localData: SchoolData, cloudData: SchoolData): SchoolData => {
-  // Cloud data is authoritative for students, registrations and placements
-  // When cloudData contains these arrays, use them directly so deletes and full replacements are respected!
-  const students = Array.isArray(cloudData.students)
-    ? cloudData.students
-    : localData.students || [];
-
-  const registrations = Array.isArray(cloudData.registrations)
-    ? cloudData.registrations
-    : localData.registrations || [];
-
-  const placements =
-    Array.isArray(cloudData.placements) && cloudData.placements.length > 0
-      ? cloudData.placements
-      : Array.isArray(localData.placements) && localData.placements.length > 0
-        ? localData.placements
-        : generatePlacementsForRegistrations(registrations);
-
-  // Preserve activities if cloud wiped or is empty
-  const activities =
-    cloudData.activities && cloudData.activities.length > 0
-      ? cloudData.activities
-      : localData.activities && localData.activities.length > 0
-        ? localData.activities
-        : getOfficialActivitiesForSchool(cloudData.school?.id || localData.school?.id);
-
-  // Preserve local coordinator if local browser has custom coordinator info
-  const hasLocalCoord = !!localData.school?.coordinator?.name;
-  const isLocalCoordDiff =
-    hasLocalCoord &&
-    (localData.school.coordinator.name !== cloudData.school?.coordinator?.name ||
-      localData.school.coordinator.phone !== cloudData.school?.coordinator?.phone);
-
-  const finalCoordinator = isLocalCoordDiff
-    ? localData.school.coordinator
-    : cloudData.school?.coordinator || localData.school?.coordinator;
-
+const mergeSchoolData = (
+  localData: SchoolData,
+  cloudData: SchoolData,
+  tombstones?: Record<string, string>,
+): SchoolData => {
+  // Union both sides. Tombstones make an intentional delete stick, and a
+  // record that exists only on one side is kept. A cloud array is not copied
+  // over the local one wholesale, so a stale browser cannot wipe rows.
+  const merged = mergeSchoolSnapshot(localData, cloudData, { tombstones });
+  const data = merged.data;
+  const fridaySlots =
+    data.school?.fridaySlots && data.school.fridaySlots.length > 0
+      ? data.school.fridaySlots
+      : localData.school?.fridaySlots;
   return {
-    ...cloudData,
+    ...data,
     school: {
-      ...cloudData.school,
-      coordinator: finalCoordinator,
-      fridaySlots:
-        cloudData.school?.fridaySlots || localData.school?.fridaySlots,
+      ...data.school,
+      fridaySlots: fridaySlots || data.school?.fridaySlots || [],
     },
-    students,
-    activities,
-    registrations,
-    placements,
+    activities:
+      data.activities && data.activities.length > 0
+        ? data.activities
+        : localData.activities && localData.activities.length > 0
+          ? localData.activities
+          : getOfficialActivitiesForSchool(data.school?.id || localData.school?.id),
   };
 };
 
@@ -341,65 +336,43 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({
       JSON.stringify(INITIAL_SCHOOLS),
     );
 
-    // Try to safely restore from persistent local backup if user imported or edited data previously
+    // Restore the main snapshot plus any safety/compact copy that still holds
+    // records an accidental shrink dropped. Tombstones keep real deletes deleted.
     try {
-      const stored = localStorage.getItem(STORAGE_KEY);
-      if (stored) {
-        const parsed = JSON.parse(stored);
-        if (parsed && typeof parsed === "object") {
-          freshSchools = parsed;
-        }
-      }
+      freshSchools = hydrateSchools(localStorage, freshSchools) as Record<string, SchoolData>;
     } catch (e) {}
 
-    // Baseline protected students & registrations so data is NEVER wiped by quota errors or empty cloud responses
-    if (freshSchools["sch-lapid-hmd"]) {
-      if (!freshSchools["sch-lapid-hmd"].students || freshSchools["sch-lapid-hmd"].students.length === 0) {
-        freshSchools["sch-lapid-hmd"].students = [...BACKUP_LAPID_STUDENTS];
-      }
-      if (!freshSchools["sch-lapid-hmd"].registrations || freshSchools["sch-lapid-hmd"].registrations.length === 0) {
-        freshSchools["sch-lapid-hmd"].registrations = [...BACKUP_LAPID_REGISTRATIONS];
-      }
-      if (!freshSchools["sch-lapid-hmd"].placements || freshSchools["sch-lapid-hmd"].placements.length === 0) {
-        freshSchools["sch-lapid-hmd"].placements = generatePlacementsForRegistrations(
-          freshSchools["sch-lapid-hmd"].registrations,
-        );
-      }
-    }
-    if (freshSchools["sch-yitzhak-navon"]) {
-      if (!freshSchools["sch-yitzhak-navon"].students || freshSchools["sch-yitzhak-navon"].students.length === 0) {
-        freshSchools["sch-yitzhak-navon"].students = [...BACKUP_NAVON_STUDENTS];
-      }
-      if (!freshSchools["sch-yitzhak-navon"].registrations || freshSchools["sch-yitzhak-navon"].registrations.length === 0) {
-        freshSchools["sch-yitzhak-navon"].registrations = [...BACKUP_NAVON_REGISTRATIONS];
-      }
-      if (!freshSchools["sch-yitzhak-navon"].placements || freshSchools["sch-yitzhak-navon"].placements.length === 0) {
-        freshSchools["sch-yitzhak-navon"].placements = generatePlacementsForRegistrations(
-          freshSchools["sch-yitzhak-navon"].registrations,
-        );
-      }
-    }
-
-    // Emergency forensic scan for empty schools only (prevents resurrection of deleted/replaced students)
+    // Fill from old browser caches only when the school list is empty.
+    // A non-empty list is left alone so an intentional delete is not undone.
     try {
       const scan = deepScanBrowserForData(freshSchools);
       Object.keys(freshSchools).forEach((k) => {
         const foundRegs = scan.foundRegistrations[k] || [];
         const foundStudents = scan.foundStudents[k] || [];
-        if (foundRegs.length > 0 && (!freshSchools[k].registrations || freshSchools[k].registrations.length === 0)) {
+        if (
+          foundRegs.length > 0 &&
+          (!freshSchools[k].registrations || freshSchools[k].registrations.length === 0)
+        ) {
           freshSchools[k].registrations = foundRegs;
-          freshSchools[k].placements = generatePlacementsForRegistrations(foundRegs);
+          if (!freshSchools[k].placements || freshSchools[k].placements.length === 0) {
+            freshSchools[k].placements = generatePlacementsForRegistrations(foundRegs);
+          }
         }
-        if (foundStudents.length > 0 && (!freshSchools[k].students || freshSchools[k].students.length === 0)) {
+        if (
+          foundStudents.length > 0 &&
+          (!freshSchools[k].students || freshSchools[k].students.length === 0)
+        ) {
           freshSchools[k].students = foundStudents;
         }
       });
     } catch (e) {}
 
+    freshSchools = foldAliasSchools(freshSchools) as Record<string, SchoolData>;
+
     Object.keys(freshSchools).forEach((k) => {
       try {
         const cached = localStorage.getItem(`cloud_act_${k}`);
-        if (cached) {
+        if (cached && (!freshSchools[k].activities || freshSchools[k].activities.length === 0)) {
           const parsed = JSON.parse(cached);
           if (Array.isArray(parsed) && parsed.length > 0) {
             freshSchools[k].activities = parsed;
@@ -423,8 +396,15 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({
         const savedStudentsRaw = localStorage.getItem(`saved_students_${k}`);
         if (savedStudentsRaw) {
           const savedStudents = JSON.parse(savedStudentsRaw);
-          if (Array.isArray(savedStudents) && savedStudents.length > 0 && (!freshSchools[k].students || freshSchools[k].students.length === 0)) {
-            freshSchools[k].students = savedStudents;
+          if (
+            Array.isArray(savedStudents) &&
+            savedStudents.length > 0 &&
+            (!freshSchools[k].students || freshSchools[k].students.length === 0)
+          ) {
+            const tombstones = readTombstones(localStorage);
+            freshSchools[k].students = savedStudents.filter(
+              (s: Student) => s?.id && !tombstones[tombKey(k, "student", s.id)],
+            );
           }
         }
       } catch (e) {}
@@ -439,7 +419,7 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({
 
   const [currentSchoolId, setCurrentSchoolId] = useState<string>(() => {
     try {
-      const savedId = localStorage.getItem(CURRENT_SCHOOL_KEY);
+      const savedId = canonicalSchoolKey(localStorage.getItem(CURRENT_SCHOOL_KEY) || "");
       if (savedId && schools[savedId]) {
         return savedId;
       }
@@ -475,17 +455,44 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({
       }
     });
 
-    const unsubscribeSchools = subscribeToSchools(async (cloudSchools) => {
+    const unsubscribeSchools = subscribeToSchools(async (cloudSchools, cloudTombstones) => {
       if (cloudSchools && Object.keys(cloudSchools).length > 0) {
         isInitialCloudSyncDone.current = true;
         const enrichedCloud = enrichAllSchoolsActivities(cloudSchools);
+        if (cloudTombstones) {
+          try {
+            const localTombstones = readTombstones(localStorage);
+            const mergedTombstones = { ...localTombstones };
+            Object.entries(cloudTombstones).forEach(([schoolId, marks]) => {
+              Object.entries(marks || {}).forEach(([key, at]) => {
+                if (!mergedTombstones[key] || Date.parse(at) > Date.parse(mergedTombstones[key] || "")) {
+                  mergedTombstones[key] = at;
+                }
+              });
+              void schoolId;
+            });
+            writeTombstones(localStorage, mergedTombstones);
+          } catch (e) {}
+        }
         setSchools((prev) => {
           const merged: Record<string, SchoolData> = { ...prev };
+          const tombstones = (() => {
+            try {
+              return readTombstones(localStorage);
+            } catch {
+              return {};
+            }
+          })();
           Object.entries(enrichedCloud).forEach(([sId, cData]) => {
-            const local = prev[sId];
-            merged[sId] = local ? mergeSchoolData(local, cData) : cData;
+            const canonicalId = canonicalSchoolKey(sId) || sId;
+            const local = prev[canonicalId] || prev[sId];
+            const cloudTomb = cloudTombstones?.[sId] || cloudTombstones?.[canonicalId] || {};
+            merged[canonicalId] = local
+              ? mergeSchoolData(local, cData, { ...tombstones, ...cloudTomb })
+              : mergeSchoolData(cData, cData, { ...tombstones, ...cloudTomb });
+            if (canonicalId !== sId) delete merged[sId];
           });
-          return merged;
+          return foldAliasSchools(merged) as Record<string, SchoolData>;
         });
         try {
           Object.entries(enrichedCloud).forEach(([sId, sData]) => {
@@ -509,11 +516,21 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({
       const enrichedCloud = enrichAllSchoolsActivities(res.schools);
       setSchools((prev) => {
         const merged: Record<string, SchoolData> = { ...prev };
+        const tombstones = (() => {
+          try {
+            return readTombstones(localStorage);
+          } catch {
+            return {};
+          }
+        })();
         Object.entries(enrichedCloud).forEach(([sId, cData]) => {
-          const local = prev[sId];
-          merged[sId] = local ? mergeSchoolData(local, cData) : cData;
+          const canonicalId = canonicalSchoolKey(sId) || sId;
+          const local = prev[canonicalId] || prev[sId];
+          merged[canonicalId] = local
+            ? mergeSchoolData(local, cData, tombstones)
+            : cData;
         });
-        return merged;
+        return foldAliasSchools(merged) as Record<string, SchoolData>;
       });
       return { success: true };
     }
@@ -522,7 +539,10 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({
 
   const uploadLocalDataToCloud = async (): Promise<{ success: boolean; error?: string }> => {
     try {
-      await saveAllSchoolsToFirestore(schools);
+      const res = await saveAllSchoolsToFirestore(schools);
+      if (!res.success) {
+        return { success: false, error: res.error || "השמירה לענן נכשלה" };
+      }
       return { success: true };
     } catch (e: any) {
       console.error("Failed to upload local data to cloud:", e);
@@ -566,21 +586,15 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({
 
         const mergedRegs = Array.from(regMap.values());
         const mergedStudents = Array.from(stMap.values());
-        const finalPlacements = generatePlacementsForRegistrations(mergedRegs);
 
         updated[sKey] = {
           ...currentData,
           registrations: mergedRegs,
           students: mergedStudents,
-          placements: finalPlacements,
         };
 
-        saveSchoolDataToFirestore(sKey, updated[sKey]);
+        persistSchoolChange(sKey, currentData, updated[sKey]);
       });
-
-      try {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(updated));
-      } catch (e) {}
 
       return updated;
     });
@@ -599,7 +613,7 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({
 
   useEffect(() => {
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(schools));
+      persistSchoolsSnapshot(localStorage, schools as Record<string, SchoolSnapshot>);
     } catch (e) {}
   }, [schools]);
 
@@ -649,14 +663,65 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({
     }
   };
 
+  const persistSchoolChange = (
+    schoolId: string,
+    before: SchoolData | undefined,
+    after: SchoolData,
+    extra?: MergeOptions,
+  ) => {
+    const id = canonicalSchoolKey(schoolId) || schoolId;
+    const deletions = before ? diffDeletions(before, after) : {};
+    const beforeStudentIds = new Set((before?.students || []).map((student) => student.id));
+    const beforeRegStudents = new Set((before?.registrations || []).map((reg) => reg.studentId));
+    const beforeRegIds = new Set((before?.registrations || []).map((reg) => reg.id));
+    const options: MergeOptions = mergeDefinedOptions(
+      {
+        ...deletions,
+        reviveStudentIds: (after.students || [])
+          .filter((student) => student?.id && !beforeStudentIds.has(student.id))
+          .map((student) => student.id),
+        reviveRegistrationStudentIds: (after.registrations || [])
+          .filter((reg) => reg?.studentId && !beforeRegStudents.has(reg.studentId))
+          .map((reg) => reg.studentId),
+        reviveRegistrationIds: (after.registrations || [])
+          .filter((reg) => reg?.id && !beforeRegIds.has(reg.id))
+          .map((reg) => reg.id),
+      },
+      extra,
+    );
+    try {
+      const deletedRegIds = new Set(options.deleteRegistrationIds || []);
+      const registrationStudentKeys = (before?.registrations || [])
+        .filter((reg) => reg?.id && reg.studentId && deletedRegIds.has(reg.id))
+        .map((reg) => tombKey(id, "registrationStudent", reg.studentId));
+      rememberTombstoneKeys(localStorage, [
+        ...tombstoneKeysForDeletions(id, options),
+        ...registrationStudentKeys,
+      ]);
+      const deleting = new Set(tombstoneKeysForDeletions(id, options));
+      const revive = [
+        ...(options.reviveStudentIds || []).map((studentId) => tombKey(id, "student", studentId)),
+        ...(options.reviveRegistrationStudentIds || []).map((studentId) =>
+          tombKey(id, "registrationStudent", studentId),
+        ),
+        ...(options.reviveRegistrationIds || []).map((regId) => tombKey(id, "registration", regId)),
+      ];
+      forgetTombstoneKeys(
+        localStorage,
+        revive.filter((key) => !deleting.has(key)),
+      );
+    } catch (e) {}
+    saveSchoolDataToFirestore(id, { ...after, school: { ...after.school, id } }, options);
+  };
+
   const updateCurrentSchoolData = (
     updater: (prev: SchoolData) => SchoolData,
+    extra?: MergeOptions,
   ) => {
     setSchools((prev) => {
       const current = prev[currentSchoolId] || activeData;
       const updated = updater(current);
-      // Sync immediately to Firestore cloud
-      saveSchoolDataToFirestore(currentSchoolId, updated);
+      persistSchoolChange(currentSchoolId, current, updated, extra);
       return {
         ...prev,
         [currentSchoolId]: updated,
@@ -772,7 +837,7 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({
               logoUrl: logoUrl || undefined,
             },
           };
-          saveSchoolDataToFirestore(schoolKey, updated[schoolKey]);
+          persistSchoolChange(schoolKey, prev[schoolKey], updated[schoolKey]);
         });
         return updated;
       });
@@ -855,14 +920,15 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({
             placements: [],
           };
           updated[schoolKey] = cleared;
-          saveSchoolDataToFirestore(schoolKey, cleared);
+          persistSchoolChange(schoolKey, sData, cleared, {
+            replaceStudents: true,
+            replaceRegistrations: true,
+            replacePlacements: true,
+          });
         } else {
           updated[schoolKey] = sData;
         }
       });
-      try {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(updated));
-      } catch (e) {}
       return updated;
     });
   };
@@ -874,16 +940,19 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({
     if (!schoolIdOrName) return null;
     const raw = String(schoolIdOrName).trim();
     if (!raw) return null;
+    const canonical = canonicalSchoolKey(raw);
+    if (canonical && schoolsMap[canonical]) return canonical;
     if (schoolsMap[raw]) return raw;
 
     // Check with extractSchoolFromText (handles "בית הספר של העתיד (בן שמן)", etc.)
     const extracted = extractSchoolFromText(raw);
-    if (extracted && schoolsMap[extracted.schoolId]) {
-      return extracted.schoolId;
+    const extractedId = extracted ? canonicalSchoolKey(extracted.schoolId) || extracted.schoolId : "";
+    if (extractedId && schoolsMap[extractedId]) {
+      return extractedId;
     }
 
-    const canonical = canonicalizeSchoolId(raw);
-    if (schoolsMap[canonical]) return canonical;
+    const canonicalFromName = canonicalizeSchoolId(raw);
+    if (schoolsMap[canonicalFromName]) return canonicalFromName;
 
     const clean = raw
       .toLowerCase()
@@ -1018,10 +1087,9 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({
           const importedMap = new Map<string, Student>(
             schoolStudents.map((s) => [s.id, s]),
           );
-          const explicitDeleteIds =
-            options?.deleteStudentIdsBySchool?.[schoolKey];
-          const deleteSet = explicitDeleteIds
-            ? new Set(explicitDeleteIds)
+          const explicitDeletes = options?.deleteStudentIdsBySchool;
+          const deleteSet = explicitDeletes
+            ? new Set(explicitDeletes[schoolKey] || [])
             : new Set(
                 currentData.students
                   .filter((s) => !importedMap.has(s.id))
@@ -1073,18 +1141,86 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({
         };
 
         updatedSchools[schoolKey] = updatedData;
-        saveSchoolDataToFirestore(schoolKey, updatedData);
-
-        // Clear legacy local storage backup keys for this school to avoid zombie resurrection
+        const replaceStudents = mode === "replace";
+        persistSchoolChange(schoolKey, currentData, updatedData, {
+          replaceStudents,
+          ...(mode === "replace"
+            ? { reviveStudentIds: newStudents.map((student) => student.id).filter(Boolean) }
+            : {}),
+          ...(mode === "sync_changes"
+            ? { deleteStudentIds: diffDeletions(currentData, updatedData).deleteStudentIds }
+            : {}),
+        });
         try {
           localStorage.removeItem(`saved_students_${schoolKey}`);
         } catch (e) {}
       });
 
-      // Update local storage immediately
-      try {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(updatedSchools));
-      } catch (e) {}
+      // If a student is explicitly assigned to another existing school, move their
+      // registrations with them. Never drop the registration on the floor.
+      const studentTargetSchoolMap = new Map<string, string>();
+      Object.entries(studentsBySchool).forEach(([sKey, sList]) => {
+        sList.forEach((s) => {
+          const target = canonicalSchoolKey(sKey) || sKey;
+          if (updatedSchools[target]) studentTargetSchoolMap.set(s.id, target);
+        });
+      });
+
+      Object.keys(updatedSchools).forEach((schoolKey) => {
+        const schoolData = updatedSchools[schoolKey];
+        if (!schoolData) return;
+
+        const foreignStudentIds = new Set<string>();
+        schoolData.students.forEach((s) => {
+          const targetSchool = studentTargetSchoolMap.get(s.id);
+          if (targetSchool && targetSchool !== schoolKey && updatedSchools[targetSchool]) {
+            foreignStudentIds.add(s.id);
+          }
+        });
+
+        if (foreignStudentIds.size > 0) {
+          foreignStudentIds.forEach((studentId) => {
+            const targetSchool = studentTargetSchoolMap.get(studentId);
+            if (!targetSchool) return;
+            const targetData = updatedSchools[targetSchool];
+            const movingRegs = schoolData.registrations.filter((r) => r.studentId === studentId);
+            const movingPlacements = schoolData.placements.filter((p) => p.studentId === studentId);
+            const regMap = new Map<string, Registration>();
+            (targetData.registrations || []).forEach((r) => regMap.set(r.studentId, r));
+            movingRegs.forEach((r) => {
+              const existing = regMap.get(r.studentId);
+              regMap.set(r.studentId, existing ? preferRegistration(existing, r) : r);
+            });
+            const placementMap = new Map<string, Placement>();
+            (targetData.placements || []).forEach((p) => placementMap.set(p.id, p));
+            movingPlacements.forEach((p) => {
+              if (!placementMap.has(p.id)) placementMap.set(p.id, p);
+            });
+            updatedSchools[targetSchool] = {
+              ...targetData,
+              registrations: Array.from(regMap.values()),
+              placements: Array.from(placementMap.values()),
+            };
+          });
+
+          const cleanedData: SchoolData = {
+            ...schoolData,
+            students: schoolData.students.filter((s) => !foreignStudentIds.has(s.id)),
+            registrations: schoolData.registrations.filter((r) => !foreignStudentIds.has(r.studentId)),
+            placements: schoolData.placements.filter((p) => !foreignStudentIds.has(p.studentId)),
+          };
+          updatedSchools[schoolKey] = cleanedData;
+          persistSchoolChange(schoolKey, schoolData, cleanedData);
+          const targetIds = new Set(
+            Array.from(foreignStudentIds)
+              .map((studentId) => studentTargetSchoolMap.get(studentId))
+              .filter((id): id is string => !!id),
+          );
+          targetIds.forEach((targetId) => {
+            persistSchoolChange(targetId, prev[targetId], updatedSchools[targetId]);
+          });
+        }
+      });
 
       return updatedSchools;
     });
@@ -1129,7 +1265,7 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({
       const current = prev[currentSchoolId];
       if (!current) return prev;
       const updated = current.activities.filter((a) => a.id !== id);
-      saveActivitiesToFirestore(currentSchoolId, updated);
+      saveActivitiesToFirestore(currentSchoolId, updated, { deleteActivityIds: [id] });
       return {
         ...prev,
         [currentSchoolId]: {
@@ -1253,7 +1389,6 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({
         };
       });
 
-      saveActivitiesToFirestore(currentSchoolId, cleanedActivities);
       return { ...prev, activities: cleanedActivities };
     });
   };
@@ -1509,23 +1644,24 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({
 
         const regMap = new Map<string, Registration>();
         (currentData.registrations || []).forEach((r) => regMap.set(r.studentId, r));
-        regsList.forEach((r) => regMap.set(r.studentId, r));
+        regsList.forEach((r) => {
+          const existing = regMap.get(r.studentId);
+          regMap.set(r.studentId, existing ? preferRegistration(existing, r) : r);
+        });
 
         const mergedRegs = Array.from(regMap.values());
-        const finalPlacements = generatePlacementsForRegistrations(mergedRegs);
+        const placementMap = new Map<string, Placement>();
+        (currentData.placements || []).forEach((p) => placementMap.set(p.id, p));
+        generatePlacementsForRegistrations(regsList).forEach((p) => placementMap.set(p.id, p));
 
-        updated[sKey] = {
+        const nextData: SchoolData = {
           ...currentData,
           registrations: mergedRegs,
-          placements: finalPlacements,
+          placements: Array.from(placementMap.values()),
         };
-
-        saveSchoolDataToFirestore(sKey, updated[sKey]);
+        updated[sKey] = nextData;
+        persistSchoolChange(sKey, currentData, nextData);
       });
-
-      try {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(updated));
-      } catch (e) {}
 
       return updated;
     });
@@ -1537,31 +1673,93 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({
     students?: Student[];
     activities?: Activity[];
     registrations?: Registration[];
+    placements?: Placement[];
     targetSchoolId?: string;
   }): { success: boolean; studentsCount: number; regsCount: number; actsCount: number } => {
-    const sId = data.targetSchoolId || currentSchoolId;
-    let sCount = 0;
-    let rCount = 0;
-    let aCount = 0;
+    const sId = canonicalSchoolKey(data.targetSchoolId || currentSchoolId) || currentSchoolId;
+    const sCount = data.students?.length || 0;
+    const rCount = data.registrations?.length || 0;
+    const aCount = data.activities?.length || 0;
 
-    if (data.students && data.students.length > 0) {
-      importStudents(data.students, "merge", { targetSchoolId: sId });
-      sCount = data.students.length;
-    }
-    if (data.activities && data.activities.length > 0) {
-      importActivities(data.activities, "merge");
-      aCount = data.activities.length;
-    }
-    if (data.registrations && data.registrations.length > 0) {
-      importRegistrations(data.registrations, sId);
-      rCount = data.registrations.length;
-    }
+    setSchools((prev) => {
+      const current = prev[sId];
+      if (!current) return prev;
+      const incoming: SchoolData = {
+        ...current,
+        students: data.students && data.students.length > 0 ? data.students.map((student) => ({
+          ...student,
+          schoolId: sId,
+          schoolName: student.schoolName || current.school.name,
+        })) : current.students,
+        activities: data.activities && data.activities.length > 0 ? data.activities : current.activities,
+        registrations: data.registrations && data.registrations.length > 0 ? data.registrations : current.registrations,
+        placements: data.placements && data.placements.length > 0 ? data.placements : current.placements,
+      };
+      const merged = mergeSchoolSnapshot(current, incoming).data as SchoolData;
+      if ((!data.placements || data.placements.length === 0) && data.registrations && data.registrations.length > 0) {
+        const placementMap = new Map<string, Placement>();
+        (merged.placements || []).forEach((p) => placementMap.set(p.id, p));
+        generatePlacementsForRegistrations(data.registrations).forEach((p) => placementMap.set(p.id, p));
+        merged.placements = Array.from(placementMap.values());
+      }
+      persistSchoolChange(sId, current, merged, {
+        reviveStudentIds: (data.students || []).map((student) => student.id).filter(Boolean),
+        reviveRegistrationStudentIds: (data.registrations || [])
+          .map((reg) => reg.studentId)
+          .filter(Boolean),
+        reviveRegistrationIds: (data.registrations || []).map((reg) => reg.id).filter(Boolean),
+      });
+      return { ...prev, [sId]: merged };
+    });
 
     return {
       success: true,
       studentsCount: sCount,
       regsCount: rCount,
       actsCount: aCount,
+    };
+  };
+
+  const restoreFullBackup = (
+    incoming: Record<string, SchoolData>,
+  ): { success: boolean; schools: number; registrations: number; students: number } => {
+    const folded = foldAliasSchools(incoming as Record<string, SchoolSnapshot>) as Record<string, SchoolData>;
+    let schoolsTouched = 0;
+    let registrations = 0;
+    let students = 0;
+    setSchools((prev) => {
+      const updated: Record<string, SchoolData> = { ...prev };
+      Object.entries(folded).forEach(([rawId, snapshot]) => {
+        if (!snapshot) return;
+        const id = canonicalSchoolKey(snapshot.school?.id || rawId) || rawId;
+        const local = updated[id];
+        const client: SchoolData = {
+          school: { ...(local?.school || snapshot.school), ...(snapshot.school || {}), id },
+          students: snapshot.students || [],
+          activities: snapshot.activities || [],
+          registrations: snapshot.registrations || [],
+          placements: snapshot.placements || [],
+        };
+        const merged = (local ? mergeSchoolSnapshot(local, client).data : client) as SchoolData;
+        updated[id] = merged;
+        persistSchoolChange(id, local, merged, {
+          reviveStudentIds: (snapshot.students || []).map((student) => student.id).filter(Boolean),
+          reviveRegistrationStudentIds: (snapshot.registrations || [])
+            .map((reg) => reg.studentId)
+            .filter(Boolean),
+          reviveRegistrationIds: (snapshot.registrations || []).map((reg) => reg.id).filter(Boolean),
+        });
+        schoolsTouched += 1;
+        registrations += snapshot.registrations?.length || 0;
+        students += snapshot.students?.length || 0;
+      });
+      return updated;
+    });
+    return {
+      success: schoolsTouched > 0,
+      schools: schoolsTouched,
+      registrations,
+      students,
     };
   };
 
@@ -1626,7 +1824,7 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({
     updateCurrentSchoolData((prev) => ({
       ...prev,
       placements: [],
-    }));
+    }), { replacePlacements: true });
     setExecutionLogs([]);
     setLastSummary(null);
   };
@@ -1638,8 +1836,12 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({
       Object.values(INITIAL_SCHOOLS)[0];
     const fresh = JSON.parse(JSON.stringify(original));
     fresh.activities = getOfficialActivitiesForSchool(currentSchoolId);
-    updateCurrentSchoolData(() => fresh);
-    saveSchoolDataToFirestore(currentSchoolId, fresh);
+    updateCurrentSchoolData(() => fresh, {
+      replaceStudents: true,
+      replaceActivities: true,
+      replaceRegistrations: true,
+      replacePlacements: true,
+    });
     setExecutionLogs([]);
     setLastSummary(null);
   };
@@ -1653,21 +1855,20 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({
           ...updated[targetId],
           activities: getOfficialActivitiesForSchool(targetId),
         };
-        saveSchoolDataToFirestore(targetId, updated[targetId]);
+        persistSchoolChange(targetId, prev[targetId], updated[targetId], {
+          replaceActivities: true,
+        });
       } else {
         Object.keys(updated).forEach((k) => {
-          updated[k] = {
+          const next = {
             ...updated[k],
             activities: getOfficialActivitiesForSchool(k),
           };
+          persistSchoolChange(k, updated[k], next, { replaceActivities: true });
+          updated[k] = next;
         });
-        saveAllSchoolsToFirestore(updated);
       }
-      const enriched = enrichAllSchoolsActivities(updated);
-      try {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(enriched));
-      } catch (e) {}
-      return enriched;
+      return enrichAllSchoolsActivities(updated);
     });
   };
 
@@ -1723,6 +1924,7 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({
         refreshFromCloud,
         uploadLocalDataToCloud,
         executeDeepCacheRecovery,
+        restoreFullBackup,
       }}
     >
       {children}
